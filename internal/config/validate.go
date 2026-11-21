@@ -7,12 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 )
 
 var networkNodeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var environmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var agentProfileIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 type ValidationIssue struct {
 	Path    string
@@ -32,12 +35,11 @@ func (err *ConfigValidationError) Error() string {
 		return "config validation failed"
 	}
 
-	if len(err.Issues) == 1 {
-		issue := err.Issues[0]
-		return fmt.Sprintf("config validation failed: %s %s", issue.Path, issue.Message)
+	details := make([]string, 0, len(err.Issues))
+	for _, issue := range err.Issues {
+		details = append(details, strings.TrimSpace(issue.Path+" "+issue.Message))
 	}
-
-	return fmt.Sprintf("config validation failed with %d issues", len(err.Issues))
+	return "config validation failed: " + strings.Join(details, "; ")
 }
 
 func Validate(config Config) error {
@@ -46,6 +48,16 @@ func Validate(config Config) error {
 
 func ValidateWithOptions(config Config, options ValidateOptions) error {
 	issues := make([]ValidationIssue, 0)
+	if nono := config.Roles.Reviewer.Nono; nono != nil {
+		if !filepath.IsAbs(nono.Profile) {
+			issues = append(issues, ValidationIssue{Path: "roles.reviewer.nono.profile", Message: "must be an absolute path to an operator-owned nono profile"})
+		}
+	}
+	for i, project := range config.Projects {
+		if project.Roles != nil && project.Roles.Reviewer != nil && project.Roles.Reviewer.Nono != nil {
+			issues = append(issues, ValidationIssue{Path: fmt.Sprintf("projects[%d].roles.reviewer.nono", i), Message: "is global-only; configure roles.reviewer.nono"})
+		}
+	}
 
 	if config.Server.Host == "" {
 		issues = append(issues, ValidationIssue{Path: "server.host", Message: "must be a non-empty string"})
@@ -106,8 +118,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	}
 
 	if config.Agent.Vendor != nil && !isValidAgentVendor(*config.Agent.Vendor) {
-		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI)})
+		issues = append(issues, ValidationIssue{Path: "agent.vendor", Message: agentVendorValidationMessage()})
 	}
+	validateAgentProfiles(config.Agent.Profiles, &issues)
+	validateRoleAgentBindings(config, &issues)
+	validateEnvironmentNames(config.Agent.Env, "agent.env", &issues)
 	validateAgentTimeouts(config.Agent.Timeouts, "agent.timeouts", &issues)
 
 	if !isValidLogLevel(config.Logging.Level) {
@@ -132,9 +147,49 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 	}
 
+	switch strings.TrimSpace(config.Notifications.Webhook.Mode) {
+	case "", "webhook":
+	case "app":
+		if config.Notifications.Webhook.Enabled {
+			if strings.TrimSpace(config.Notifications.Webhook.AppIDEnv) == "" {
+				issues = append(issues, ValidationIssue{Path: "notifications.webhook.appIdEnv", Message: "is required when notifications.webhook.mode is app"})
+			}
+			if strings.TrimSpace(config.Notifications.Webhook.AppSecretEnv) == "" {
+				issues = append(issues, ValidationIssue{Path: "notifications.webhook.appSecretEnv", Message: "is required when notifications.webhook.mode is app"})
+			}
+			if strings.TrimSpace(config.Notifications.Webhook.ChatID) == "" {
+				issues = append(issues, ValidationIssue{Path: "notifications.webhook.chatId", Message: "is required when notifications.webhook.mode is app"})
+			}
+		}
+	default:
+		issues = append(issues, ValidationIssue{Path: "notifications.webhook.mode", Message: "must be one of: webhook, app"})
+	}
+
+	transport := strings.ToLower(strings.TrimSpace(config.HITL.AnswerTransport))
+	switch transport {
+	case "", "github", "respond":
+	case "feishu":
+		if config.HITL.Feishu == nil {
+			issues = append(issues, ValidationIssue{Path: "hitl.feishu", Message: "is required when hitl.answerTransport is feishu"})
+		} else {
+			if !strings.EqualFold(strings.TrimSpace(config.HITL.Feishu.Inbound), "cf-inbox") {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.inbound", Message: "must be cf-inbox when hitl.answerTransport is feishu"})
+			}
+			if strings.TrimSpace(config.HITL.Feishu.EventInboxURLEnv) == "" {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxUrlEnv", Message: "is required when hitl.answerTransport is feishu"})
+			}
+			if strings.TrimSpace(config.HITL.Feishu.EventInboxTokenEnv) == "" {
+				issues = append(issues, ValidationIssue{Path: "hitl.feishu.eventInboxTokenEnv", Message: "is required when hitl.answerTransport is feishu"})
+			}
+		}
+	default:
+		issues = append(issues, ValidationIssue{Path: "hitl.answerTransport", Message: "must be one of: github, feishu, respond"})
+	}
+
 	if !isValidDaemonMode(config.Daemon.Mode) {
 		issues = append(issues, ValidationIssue{Path: "daemon.mode", Message: fmt.Sprintf("must be one of: %s, %s", DaemonModeForeground, DaemonModeLaunchd)})
 	}
+	validateEnvironmentNames(config.Daemon.Environment, "daemon.environment", &issues)
 
 	if !isValidDaemonRestartPolicy(config.Daemon.RestartPolicy) {
 		issues = append(issues, ValidationIssue{Path: "daemon.restartPolicy", Message: fmt.Sprintf("must be one of: %s, %s, %s", DaemonRestartNever, DaemonRestartOnFailure, DaemonRestartAlways)})
@@ -173,12 +228,14 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		issues = append(issues, ValidationIssue{Path: "defaults.addSnapshotMode", Message: fmt.Sprintf("must be one of: %s, %s, %s", AddSnapshotModeAsync, AddSnapshotModeFull, AddSnapshotModeOff)})
 	}
 
-	if config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds < 0 {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.quietPeriodSeconds", Message: "must be an integer >= 0"})
-	}
+	validateQuietPeriodSeconds(config.Defaults.Loop.QuietPeriodSeconds, "defaults.loop.quietPeriodSeconds", &issues)
+	validateQuietPeriodSeconds(config.Roles.Reviewer.Behavior.Loop.QuietPeriodSeconds, "roles.reviewer.behavior.loop.quietPeriodSeconds", &issues)
+	validateQuietPeriodSeconds(config.Roles.Fixer.Behavior.Loop.QuietPeriodSeconds, "roles.fixer.behavior.loop.quietPeriodSeconds", &issues)
 	if config.Roles.Reviewer.Behavior.Loop.MinPublishIntervalSeconds < 0 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.loop.minPublishIntervalSeconds", Message: "must be an integer >= 0"})
 	}
+	validateReviewFixBudgetCap(config.Roles.Reviewer.Behavior.Loop.MaxPublishesPerPR, "roles.reviewer.behavior.loop.maxPublishesPerPR", &issues)
+	validateReviewFixBudgetCap(config.Roles.Fixer.Behavior.Loop.MaxPushesPerPR, "roles.fixer.behavior.loop.maxPushesPerPR", &issues)
 	if config.Roles.Reviewer.Behavior.Retry.AutoRecoveryMaxAttempts < 1 {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.retry.autoRecoveryMaxAttempts", Message: "must be a positive integer"})
 	}
@@ -193,8 +250,11 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if !isValidReviewerScope(config.Roles.Reviewer.Behavior.Scope) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.scope", Message: fmt.Sprintf("must be one of: %s, %s, %s", ReviewerScopeFullPR, ReviewerScopeChangedFiles, ReviewerScopeChangedRanges)})
 	}
-	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview {
-		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s", ReviewerPublishModeSingleReview)})
+	if config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSingleReview && config.Roles.Reviewer.Behavior.PublishMode != ReviewerPublishModeSummaryComment {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.publishMode", Message: fmt.Sprintf("must be %s or %s", ReviewerPublishModeSingleReview, ReviewerPublishModeSummaryComment)})
+	}
+	if config.Roles.Reviewer.Behavior.RelatedFileGroups.MinChangedFiles < 1 {
+		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.relatedFileGroups.minChangedFiles", Message: "must be a positive integer"})
 	}
 	if !isValidReviewerThreadResolutionMode(config.Roles.Reviewer.Behavior.ThreadResolution.Mode) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.threadResolution.mode", Message: fmt.Sprintf("must be one of: %s, %s, %s, %s", ReviewerThreadResolutionModeReportOnly, ReviewerThreadResolutionModeCommentOnly, ReviewerThreadResolutionModeSuggestResolution, ReviewerThreadResolutionModeResolveObjective)})
@@ -220,6 +280,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	if config.Roles.Reviewer.AutoMerge.Scope != ReviewerAutoMergeScopeLooperOnly {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.autoMerge.scope", Message: fmt.Sprintf("must be %s", ReviewerAutoMergeScopeLooperOnly)})
 	}
+	validateReviewerSkillsConfig(config.Roles.Reviewer.Skills, "roles.reviewer.skills", &issues)
 	if config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment && config.Roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventApprove {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.behavior.reviewEvents.clean", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerReviewEventComment, ReviewerReviewEventApprove)})
 	}
@@ -238,6 +299,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 	} else if config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel != strings.TrimSpace(config.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel) {
 		issues = append(issues, ValidationIssue{Path: "roles.reviewer.discovery.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
 	}
+	validateReviewerFollowUpInterval(config.Roles.Reviewer.Discovery.FollowUpInterval, "roles.reviewer.discovery.followUpInterval", &issues)
 
 	providerIDs := make(map[string]ProviderKind, len(config.Providers))
 	for index, provider := range config.Providers {
@@ -250,14 +312,28 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 			providerIDs[provider.ID] = provider.Kind
 		}
 		if !isValidProviderKind(provider.Kind) {
-			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be one of: %s, %s", ProviderKindGitHub, ProviderKindForgejo)})
+			issues = append(issues, ValidationIssue{Path: prefix + ".kind", Message: fmt.Sprintf("must be one of: %s, %s, %s", ProviderKindGitHub, ProviderKindForgejo, ProviderKindPlane)})
 		}
 		if provider.Kind == ProviderKindForgejo {
 			if !isAbsoluteHTTPURL(provider.BaseURL) {
 				issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL for forgejo providers"})
 			}
+			validateForgejoProviderAuth(config, provider, prefix, &issues)
+		}
+		if provider.Kind == ProviderKindPlane {
+			// baseUrl is optional (a default Plane host is used when omitted); if
+			// provided it must be an absolute http(s) URL.
+			if strings.TrimSpace(provider.BaseURL) != "" && !isAbsoluteHTTPURL(provider.BaseURL) {
+				issues = append(issues, ValidationIssue{Path: prefix + ".baseUrl", Message: "must be an absolute http(s) URL for plane providers"})
+			}
 			if isNilOrEmptyString(provider.TokenEnv) {
-				issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "is required for forgejo providers"})
+				issues = append(issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "is required for plane providers (names the env var holding the Plane API key)"})
+			}
+			if isNilOrEmptyString(provider.Workspace) {
+				issues = append(issues, ValidationIssue{Path: prefix + ".workspace", Message: "is required for plane providers (Plane workspace slug)"})
+			}
+			if isNilOrEmptyString(provider.ProjectID) {
+				issues = append(issues, ValidationIssue{Path: prefix + ".projectId", Message: "is required for plane providers (Plane project UUID)"})
 			}
 		}
 	}
@@ -303,19 +379,29 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 				issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: "is required for forgejo projects"})
 			}
 		}
+		if providerKind == ProviderKindPlane {
+			if strings.TrimSpace(project.Provider) == "" {
+				issues = append(issues, ValidationIssue{Path: prefix + ".provider", Message: "is required for plane projects"})
+			}
+			// repo names the GitHub code repository (owner/name) where pull
+			// requests are opened; Plane only supplies the work-items.
+			if strings.TrimSpace(project.Repo) == "" {
+				issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: "is required for plane projects (the GitHub code repo, owner/name, where PRs are opened)"})
+			}
+		}
 		if strings.TrimSpace(project.Repo) != "" {
-			repo := strings.ToLower(strings.TrimSpace(project.Repo))
-			if previousIndex, exists := projectRepos[repo]; exists {
+			identity, resolved := ProjectRepositoryIdentity(config, project)
+			if previousIndex, exists := projectRepos[identity.Key()]; resolved && exists {
 				issues = append(issues, ValidationIssue{Path: prefix + ".repo", Message: fmt.Sprintf("duplicates projects[%d].repo: %s", previousIndex, project.Repo)})
-			} else {
-				projectRepos[repo] = index
+			} else if resolved {
+				projectRepos[identity.Key()] = index
 			}
 		}
 		if project.Path != "" && project.RepoPath != "" && project.Path != project.RepoPath {
 			issues = append(issues, ValidationIssue{Path: prefix + ".path", Message: "must match repoPath when both path and repoPath are set"})
 		}
-		if providerKind == ProviderKindForgejo && project.Webhook.Mode != "" {
-			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: "must be omitted for forgejo projects; forgejo MVP uses polling only"})
+		if providerKind == ProviderKindForgejo && project.Webhook.Mode == WebhookModeGHForward {
+			issues = append(issues, ValidationIssue{Path: prefix + ".webhook.mode", Message: "must be tunnel or omitted for forgejo projects; gh-forward is GitHub-only"})
 		}
 		if providerKind == ProviderKindForgejo && normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
 			issues = append(issues, ValidationIssue{Path: prefix + ".network.mode", Message: "must be off for forgejo projects; routed network mode is not supported"})
@@ -331,6 +417,7 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		}
 
 		validateProjectRoleOverrides(project.Roles, prefix+".roles", config.Instructions.MaxBytes, &issues)
+		validateProjectRoleAgentBindings(project.Roles, prefix+".roles", &issues)
 		effectiveProjectRoles := ProjectRoleConfigs(config, project.ID)
 		for _, roleInstruction := range roleInstructions(effectiveProjectRoles) {
 			if !projectRoleInstructionsConfigured(project.Roles, roleInstruction.role) {
@@ -342,16 +429,24 @@ func ValidateWithOptions(config Config, options ValidateOptions) error {
 		if effectiveProjectRoles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel && strings.TrimSpace(effectiveProjectRoles.Reviewer.Discovery.SpecReview.ReviewingLabel) == "" {
 			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.specReview.reviewingLabel", Message: "must be a non-empty string when includeReviewingLabel is true"})
 		}
+		validateReviewerFollowUpInterval(effectiveProjectRoles.Reviewer.Discovery.FollowUpInterval, prefix+".roles.reviewer.discovery.followUpInterval", &issues)
+		if project.Roles != nil && project.Roles.Reviewer != nil && project.Roles.Reviewer.Skills != nil {
+			validateReviewerSkillsConfig(effectiveProjectRoles.Reviewer.Skills, prefix+".roles.reviewer.skills", &issues)
+		}
 		if project.Roles != nil && project.Roles.Coordinator != nil {
 			validateCoordinatorRoleConfig(effectiveProjectRoles.Coordinator, prefix+".roles.coordinator", &issues)
 		}
 		if providerKind == ProviderKindForgejo {
 			validateForgejoRoleCapabilities(effectiveProjectRoles, prefix, &issues)
+		} else if effectiveProjectRoles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
+			issues = append(issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.publishMode", Message: "summary_comment is supported only for forgejo projects"})
 		}
 		if normalizeNetworkMode(project.Network.Mode) == NetworkModeRouted {
 			validateRoutedProjectPrerequisites(config, effectiveProjectRoles, prefix, &issues)
 		}
 	}
+
+	validateHostingIdentities(config, &issues)
 
 	if len(issues) > 0 {
 		return &ConfigValidationError{Issues: issues}
@@ -408,8 +503,38 @@ func isValidNetworkMode(mode NetworkMode) bool {
 	return normalizeNetworkMode(mode) == NetworkModeOff || normalizeNetworkMode(mode) == NetworkModeRouted
 }
 
+func validateForgejoProviderAuth(cfg Config, provider ProviderConfig, prefix string, issues *[]ValidationIssue) {
+	auth := EffectiveProviderAuth(provider)
+	switch auth {
+	case ProviderAuthTea:
+		if isNilOrEmptyString(provider.TeaLogin) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "is required when auth is tea"})
+		}
+		if !isNilOrEmptyString(provider.TokenEnv) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "must be omitted when auth is tea"})
+		}
+	case ProviderAuthTokenEnv:
+		if isNilOrEmptyString(provider.TokenEnv) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".tokenEnv", Message: "is required when auth is token-env"})
+		}
+		if !isNilOrEmptyString(provider.TeaLogin) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".teaLogin", Message: "must be omitted when auth is token-env"})
+		}
+	case "":
+		if provider.Auth != "" {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
+		} else if !isNilOrEmptyString(provider.TokenEnv) && !isNilOrEmptyString(provider.TeaLogin) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".auth", Message: "must be set explicitly when both tokenEnv and teaLogin are present"})
+		} else if !forgejoProviderUsesOnlyHostingIdentities(cfg, provider) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be %s (with tokenEnv) or %s (with teaLogin)", ProviderAuthTokenEnv, ProviderAuthTea)})
+		}
+	default:
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".auth", Message: fmt.Sprintf("must be one of: %s, %s", ProviderAuthTokenEnv, ProviderAuthTea)})
+	}
+}
+
 func isValidProviderKind(kind ProviderKind) bool {
-	return kind == ProviderKindGitHub || kind == ProviderKindForgejo
+	return kind == ProviderKindGitHub || kind == ProviderKindForgejo || kind == ProviderKindPlane
 }
 
 func isAbsoluteHTTPURL(value string) bool {
@@ -421,27 +546,27 @@ func isAbsoluteHTTPURL(value string) bool {
 }
 
 func validateForgejoRoleCapabilities(roles RoleConfigs, prefix string, issues *[]ValidationIssue) {
-	if roles.Reviewer.Discovery.Triggers.RequireReviewRequest {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.discovery.triggers.requireReviewRequest", Message: "must be false for forgejo projects"})
-	}
-	if roles.Reviewer.Behavior.ReviewEvents.Clean != ReviewerReviewEventComment {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.reviewEvents.clean", Message: "must be COMMENT for forgejo projects"})
-	}
-	if roles.Reviewer.Behavior.ReviewEvents.Blocking != ReviewerReviewEventComment {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.reviewEvents.blocking", Message: "must be COMMENT for forgejo projects"})
-	}
-	if roles.Reviewer.AutoMerge.Enabled {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.autoMerge.enabled", Message: "must be false for forgejo projects"})
-	}
 	if roles.Reviewer.Behavior.ThreadResolution.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.behavior.threadResolution.enabled", Message: "must be false for forgejo projects"})
-	}
-	if roles.Fixer.AutoDiscovery {
-		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.fixer.autoDiscovery", Message: "must be false for forgejo projects"})
 	}
 	if roles.Coordinator.Enabled {
 		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.coordinator.enabled", Message: "must be false for forgejo projects"})
 	}
+	if roles.Reviewer.AutoMerge.Enabled && roles.Reviewer.Behavior.PublishMode == ReviewerPublishModeSummaryComment {
+		*issues = append(*issues, ValidationIssue{Path: prefix + ".roles.reviewer.autoMerge.enabled", Message: "must be false when publishMode is summary_comment"})
+	}
+}
+
+// ValidateForgejoRoleCapabilities rejects role settings that require GitHub-only
+// APIs. Callers should apply the Forgejo project profile before validating so
+// omitted project settings receive provider-compatible defaults.
+func ValidateForgejoRoleCapabilities(roles RoleConfigs, prefix string) error {
+	issues := make([]ValidationIssue, 0)
+	validateForgejoRoleCapabilities(roles, prefix, &issues)
+	if len(issues) == 0 {
+		return nil
+	}
+	return &ConfigValidationError{Issues: issues}
 }
 
 func normalizeNetworkMode(mode NetworkMode) NetworkMode {
@@ -522,12 +647,45 @@ func validateAgentTimeouts(timeouts AgentTimeoutConfig, path string, issues *[]V
 	validateAgentTimeoutSeconds(timeouts.FixerMaxRuntimeSeconds, path+".fixerMaxRuntimeSeconds", issues)
 }
 
+func validateEnvironmentNames(values map[string]string, path string, issues *[]ValidationIssue) {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if !environmentNamePattern.MatchString(key) {
+			*issues = append(*issues, ValidationIssue{Path: path + "." + key, Message: "must be a valid environment-variable name"})
+		}
+	}
+}
+
 func validateAgentTimeoutSeconds(seconds int, path string, issues *[]ValidationIssue) {
 	if seconds < 1 {
 		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a positive integer"})
 		return
 	}
 
+	const maxDuration = time.Duration(1<<63 - 1)
+	maxSeconds := int64(maxDuration / time.Second)
+	if int64(seconds) > maxSeconds {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must fit within time.Duration when converted from seconds"})
+	}
+}
+
+func validateReviewFixBudgetCap(value int, path string, issues *[]ValidationIssue) {
+	if value < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be an integer >= 0"})
+	}
+}
+
+// validateQuietPeriodSeconds rejects negatives and values that overflow time.Duration
+// when converted from seconds (now.Add(time.Duration(seconds) * time.Second)).
+func validateQuietPeriodSeconds(seconds int, path string, issues *[]ValidationIssue) {
+	if seconds < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be an integer >= 0"})
+		return
+	}
 	const maxDuration = time.Duration(1<<63 - 1)
 	maxSeconds := int64(maxDuration / time.Second)
 	if int64(seconds) > maxSeconds {
@@ -573,6 +731,19 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 				*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.specReview.reviewingLabel", Message: "must not contain leading or trailing whitespace"})
 			}
 		}
+		if roles.Reviewer.Behavior != nil && roles.Reviewer.Behavior.Loop != nil {
+			if roles.Reviewer.Behavior.Loop.QuietPeriodSeconds != nil {
+				validateQuietPeriodSeconds(*roles.Reviewer.Behavior.Loop.QuietPeriodSeconds, prefix+".reviewer.behavior.loop.quietPeriodSeconds", issues)
+			}
+			if roles.Reviewer.Behavior.Loop.MaxPublishesPerPR != nil {
+				validateReviewFixBudgetCap(*roles.Reviewer.Behavior.Loop.MaxPublishesPerPR, prefix+".reviewer.behavior.loop.maxPublishesPerPR", issues)
+			}
+		}
+		if roles.Reviewer.Behavior != nil && roles.Reviewer.Behavior.RelatedFileGroups != nil && roles.Reviewer.Behavior.RelatedFileGroups.MinChangedFiles != nil {
+			if *roles.Reviewer.Behavior.RelatedFileGroups.MinChangedFiles < 1 {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".reviewer.behavior.relatedFileGroups.minChangedFiles", Message: "must be a positive integer"})
+			}
+		}
 		if roles.Reviewer.AutoMerge != nil {
 			validatePartialReviewerAutoMerge(*roles.Reviewer.AutoMerge, prefix+".reviewer.autoMerge", issues)
 		}
@@ -581,6 +752,14 @@ func validateProjectRoleOverrides(roles *PartialRoleConfigs, prefix string, maxI
 		validateProjectRoleInstruction(prefix+".fixer.instructions", "fixer", roles.Fixer.Instructions, maxInstructionBytes, issues)
 		if roles.Fixer.Triggers != nil {
 			validateFixerRoleTriggers(partialFixerRoleTriggers(*roles.Fixer.Triggers), prefix+".fixer.triggers", issues)
+		}
+		if roles.Fixer.Behavior != nil && roles.Fixer.Behavior.Loop != nil {
+			if roles.Fixer.Behavior.Loop.QuietPeriodSeconds != nil {
+				validateQuietPeriodSeconds(*roles.Fixer.Behavior.Loop.QuietPeriodSeconds, prefix+".fixer.behavior.loop.quietPeriodSeconds", issues)
+			}
+			if roles.Fixer.Behavior.Loop.MaxPushesPerPR != nil {
+				validateReviewFixBudgetCap(*roles.Fixer.Behavior.Loop.MaxPushesPerPR, prefix+".fixer.behavior.loop.maxPushesPerPR", issues)
+			}
 		}
 	}
 	if roles.Coordinator != nil {
@@ -774,11 +953,110 @@ func isNilOrEmptyString(value *string) bool {
 
 func isValidAgentVendor(vendor AgentVendor) bool {
 	switch vendor {
-	case AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI:
+	case AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild, AgentVendorPi, AgentVendorOmp, AgentVendorAgy:
 		return true
 	default:
 		return false
 	}
+}
+
+func agentVendorValidationMessage() string {
+	return fmt.Sprintf("must be one of: %s, %s, %s, %s, %s, %s, %s, %s", AgentVendorClaudeCode, AgentVendorCodex, AgentVendorOpenCode, AgentVendorCursorCLI, AgentVendorGrokBuild, AgentVendorPi, AgentVendorOmp, AgentVendorAgy)
+}
+
+func validateAgentProfiles(profiles map[string]AgentBindingConfig, issues *[]ValidationIssue) {
+	if len(profiles) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(profiles))
+	for id := range profiles {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		path := "agent.profiles." + id
+		if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || !agentProfileIDPattern.MatchString(id) {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: "profile id must be non-empty, trimmed, and match [A-Za-z0-9_-]+"})
+			continue
+		}
+		binding := profiles[id]
+		if binding.Vendor == nil && binding.Model == nil {
+			*issues = append(*issues, ValidationIssue{Path: path, Message: "must set at least one of vendor or model"})
+		}
+		if binding.Vendor != nil && !isValidAgentVendor(*binding.Vendor) {
+			*issues = append(*issues, ValidationIssue{Path: path + ".vendor", Message: agentVendorValidationMessage()})
+		}
+	}
+}
+
+func validateRoleAgentBindings(config Config, issues *[]ValidationIssue) {
+	type roleBinding struct {
+		role  string
+		agent *RoleAgentConfig
+	}
+	bindings := []roleBinding{
+		{role: CodingRolePlanner, agent: config.Roles.Planner.Agent},
+		{role: CodingRoleWorker, agent: config.Roles.Worker.Agent},
+		{role: CodingRoleReviewer, agent: config.Roles.Reviewer.Agent},
+		{role: CodingRoleFixer, agent: config.Roles.Fixer.Agent},
+	}
+	for _, binding := range bindings {
+		if binding.agent == nil {
+			continue
+		}
+		prefix := "roles." + binding.role + ".agent"
+		if binding.agent.Profile != nil {
+			profileID := *binding.agent.Profile
+			trimmed := strings.TrimSpace(profileID)
+			if trimmed == "" || profileID != trimmed {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: "must be a non-empty trimmed profile id"})
+			} else if _, exists := config.Agent.Profiles[trimmed]; !exists {
+				*issues = append(*issues, ValidationIssue{Path: prefix + ".profile", Message: fmt.Sprintf("references unknown agent profile: %s", trimmed)})
+			}
+		}
+		if binding.agent.Vendor != nil && !isValidAgentVendor(*binding.agent.Vendor) {
+			*issues = append(*issues, ValidationIssue{Path: prefix + ".vendor", Message: agentVendorValidationMessage()})
+		}
+	}
+}
+
+func validateProjectRoleAgentBindings(roles *PartialRoleConfigs, prefix string, issues *[]ValidationIssue) {
+	if roles == nil {
+		return
+	}
+	type roleBinding struct {
+		role  string
+		agent *RoleAgentConfig
+	}
+	var bindings []roleBinding
+	if roles.Planner != nil {
+		bindings = append(bindings, roleBinding{role: CodingRolePlanner, agent: roles.Planner.Agent})
+	}
+	if roles.Worker != nil {
+		bindings = append(bindings, roleBinding{role: CodingRoleWorker, agent: roles.Worker.Agent})
+	}
+	if roles.Reviewer != nil {
+		bindings = append(bindings, roleBinding{role: CodingRoleReviewer, agent: roles.Reviewer.Agent})
+	}
+	if roles.Fixer != nil {
+		bindings = append(bindings, roleBinding{role: CodingRoleFixer, agent: roles.Fixer.Agent})
+	}
+	for _, binding := range bindings {
+		if !roleAgentBindingSet(binding.agent) {
+			continue
+		}
+		*issues = append(*issues, ValidationIssue{
+			Path:    prefix + "." + binding.role + ".agent",
+			Message: "project-level agent bindings are not supported",
+		})
+	}
+}
+
+func roleAgentBindingSet(agent *RoleAgentConfig) bool {
+	if agent == nil {
+		return false
+	}
+	return agent.Profile != nil || agent.Vendor != nil || agent.Model != nil
 }
 
 func isValidAuthMode(mode AuthMode) bool {
@@ -896,6 +1174,30 @@ func validatePartialReviewerAutoMerge(partial PartialReviewerAutoMergeConfig, pa
 	}
 }
 
+func validateReviewerSkillsConfig(skills ReviewerSkillsConfig, path string, issues *[]ValidationIssue) {
+	if !isValidReviewerSkillsMode(skills.Mode) {
+		*issues = append(*issues, ValidationIssue{Path: path + ".mode", Message: fmt.Sprintf("must be one of: %s, %s", ReviewerSkillsModeExtend, ReviewerSkillsModeReplace)})
+		return
+	}
+	mode := skills.Mode
+	if mode == "" {
+		mode = ReviewerSkillsModeExtend
+	}
+	validateStringList(skills.Required, path+".required", issues)
+	if mode == ReviewerSkillsModeReplace && len(skills.Required) == 0 {
+		*issues = append(*issues, ValidationIssue{Path: path + ".required", Message: "must contain at least one skill when mode is replace"})
+	}
+}
+
+func isValidReviewerSkillsMode(mode ReviewerSkillsMode) bool {
+	switch mode {
+	case "", ReviewerSkillsModeExtend, ReviewerSkillsModeReplace:
+		return true
+	default:
+		return false
+	}
+}
+
 func validateIssueRoleTriggers(triggers IssueRoleTriggersConfig, path string, issues *[]ValidationIssue) {
 	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
 }
@@ -908,6 +1210,17 @@ func validateFixerRoleTriggers(triggers FixerRoleTriggersConfig, path string, is
 	validateLabelTriggers(triggers.Labels, triggers.LabelMode, path, issues)
 	if !isValidFixerAuthorFilter(triggers.AuthorFilter) {
 		*issues = append(*issues, ValidationIssue{Path: path + ".authorFilter", Message: fmt.Sprintf("must be one of: %s, %s", FixerAuthorFilterCurrentUser, FixerAuthorFilterAny)})
+	}
+}
+
+func validateReviewerFollowUpInterval(value, path string, issues *[]ValidationIssue) {
+	if strings.TrimSpace(value) == "" {
+		return
+	}
+	if duration, err := time.ParseDuration(strings.TrimSpace(value)); err != nil {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must be a valid time.Duration string"})
+	} else if duration < 0 {
+		*issues = append(*issues, ValidationIssue{Path: path, Message: "must not be negative"})
 	}
 }
 

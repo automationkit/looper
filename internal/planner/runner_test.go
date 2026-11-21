@@ -2,7 +2,9 @@ package planner
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/storage"
@@ -120,6 +123,295 @@ func TestDiscoverIssuesEnqueuesEligibleWorkAndCreatesLoop(t *testing.T) {
 	}
 }
 
+func TestDiscoverIssuesSkipsGlobalHoldLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 42, Title: "Plan this", Assignees: []string{"octocat"}, Labels: []string{"looper:plan", domain.HoldLabelGlobal}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %#v, want held issue skipped", result)
+	}
+}
+
+func TestProcessClaimedItemSkipsHeldPlannerIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issueNumber := int64(42)
+	loopTarget := buildIssueTargetID(repo, issueNumber)
+	nowISO := fixture.nowISO()
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_planner_hold", Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &loopTarget, Repo: &repo, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_planner_hold"
+	lockKey := storage.IssueLockKey(projectID, repo, issueNumber)
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_planner_hold", ProjectID: &projectID, LoopID: &loopID, Type: "planner", TargetType: "issue", TargetID: loopTarget, Repo: &repo, DedupeKey: "planner:hold", Priority: storage.QueuePriorityPlanner, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issueNumber, Labels: []string{domain.HoldLabelGlobal}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_planner_hold", ProjectID: &projectID, LoopID: &loopID, Type: "planner", TargetType: "issue", TargetID: loopTarget, Repo: &repo, Status: "running"})
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped", result)
+	}
+	loop, _ := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if loop == nil || loop.Status != "queued" {
+		t.Fatalf("loop = %#v, want queued", loop)
+	}
+	queue, _ := fixture.repos.Queue.GetByID(context.Background(), "queue_planner_hold")
+	if queue == nil || queue.Status != "completed" {
+		t.Fatalf("queue = %#v, want completed", queue)
+	}
+	if len(github.createPRCalls) != 0 {
+		t.Fatalf("createPRCalls = %#v, want none", github.createPRCalls)
+	}
+}
+
+func TestRunPublishStepSkipsWhenHoldAddedBeforePush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Labels: []string{domain.HoldLabelGlobal}}}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, Checkpoint: plannerCheckpoint{Issue: &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this"}, Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "planner/42", BaseBranch: "main"}, WriteSpec: &checkpointWriteSpec{Status: "completed"}}})
+	if err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("runPublishStep() error = %v, want hold skip", err)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("checkpoint = %#v, want unchanged checkpoint before hold handling", checkpoint)
+	}
+	if len(git.pushCalls) != 0 {
+		t.Fatalf("pushCalls = %#v, want none", git.pushCalls)
+	}
+}
+
+func TestRunPublishStepRechecksHoldAfterCreatingPullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		issueDetails: []IssueDetail{
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan", domain.HoldLabelGlobal}},
+		},
+		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+	loopID := "loop_planner_publish_hold_after_pr"
+	runID := "run_planner_publish_hold_after_pr"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:      storage.LoopRecord{ID: loopID, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running"},
+		Run:       storage.RunRecord{ID: runID, LoopID: loopID},
+		QueueItem: storage.QueueItemRecord{ID: "queue_1", PayloadJSON: stringPtr(`{"issueNumber":42}`)},
+		Checkpoint: plannerCheckpoint{
+			Issue:     &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", RequestedReviewers: []string{"teammate"}},
+			Worktree:  &checkpointWorktree{Path: t.TempDir(), Branch: "planner/42", BaseBranch: "main"},
+			WriteSpec: &checkpointWriteSpec{Status: "completed"},
+		},
+	})
+
+	if err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("runPublishStep() error = %v, want hold skip after PR create", err)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("pushCalls = %#v, want one push before post-PR hold", git.pushCalls)
+	}
+	if len(github.createPRCalls) != 1 {
+		t.Fatalf("createPRCalls = %#v, want one created PR before post-PR hold", github.createPRCalls)
+	}
+	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number != 101 {
+		t.Fatalf("checkpoint.Publish = %#v, want PR reference preserved before hold skip", checkpoint.Publish)
+	}
+	if len(github.addLabelCalls) != 0 {
+		t.Fatalf("addLabelCalls = %#v, want no spec-reviewing label after post-PR hold", github.addLabelCalls)
+	}
+	if len(github.addReviewerCalls) != 0 {
+		t.Fatalf("addReviewerCalls = %#v, want no reviewers after post-PR hold", github.addReviewerCalls)
+	}
+}
+
+func TestRunPublishStepRechecksPullRequestHoldAfterCreatingPullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		issueDetails: []IssueDetail{
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
+			{Number: 42, Title: "Plan this", Labels: []string{"looper:plan"}},
+		},
+		prDetail:       PullRequestDetail{Number: 101, Labels: []string{domain.HoldLabelGlobal}},
+		createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"},
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+	loopID := "loop_planner_publish_pr_hold_after_pr"
+	runID := "run_planner_publish_pr_hold_after_pr"
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:      storage.LoopRecord{ID: loopID, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running"},
+		Run:       storage.RunRecord{ID: runID, LoopID: loopID},
+		QueueItem: storage.QueueItemRecord{ID: "queue_1", PayloadJSON: stringPtr(`{"issueNumber":42}`)},
+		Checkpoint: plannerCheckpoint{
+			Issue:     &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", RequestedReviewers: []string{"teammate"}},
+			Worktree:  &checkpointWorktree{Path: t.TempDir(), Branch: "planner/42", BaseBranch: "main"},
+			WriteSpec: &checkpointWriteSpec{Status: "completed"},
+		},
+	})
+
+	if err == nil || !strings.Contains(err.Error(), "acme/looper#101 is currently held") {
+		t.Fatalf("runPublishStep() error = %v, want PR hold skip", err)
+	}
+	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number != 101 {
+		t.Fatalf("checkpoint.Publish = %#v, want PR reference preserved before PR hold skip", checkpoint.Publish)
+	}
+	if len(github.addLabelCalls) != 0 {
+		t.Fatalf("addLabelCalls = %#v, want no spec-reviewing label after PR hold", github.addLabelCalls)
+	}
+	if len(github.addReviewerCalls) != 0 {
+		t.Fatalf("addReviewerCalls = %#v, want no reviewers after PR hold", github.addReviewerCalls)
+	}
+}
+
+func TestRunPublishStepChecksLifecycleAdoptedPullRequestHoldBeforeDisclosure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopID := "loop_planner_lifecycle_adopted_pr_hold"
+	runID := "run_planner_lifecycle_adopted_pr_hold"
+	repoPath := t.TempDir()
+	branch := "planner/42"
+	github := &fakeGitHubGateway{
+		issueDetail: IssueDetail{Number: 42, Labels: []string{"looper:plan"}},
+		prDetail:    PullRequestDetail{Number: 202, URL: "https://example/pr/202", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Labels: []string{domain.HoldLabelGlobal}, Body: "## Summary\n\nExisting spec PR"},
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: repoPath},
+		Loop:      storage.LoopRecord{ID: loopID, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running"},
+		Run:       storage.RunRecord{ID: runID, LoopID: loopID},
+		QueueItem: storage.QueueItemRecord{ID: "queue_1", PayloadJSON: stringPtr(`{"issueNumber":42}`)},
+		Checkpoint: plannerCheckpoint{
+			Issue:     &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", RequestedReviewers: []string{"teammate"}},
+			Worktree:  &checkpointWorktree{Path: t.TempDir(), Branch: branch, BaseBranch: "main"},
+			WriteSpec: &checkpointWriteSpec{Status: "completed"},
+			Lifecycle: &lifecycle.State{Branch: branch, BaseBranch: "main", PRNumber: 202, PRURL: "https://example/pr/202", Actions: lifecycle.Actions{PR: lifecycle.ActionSourceAgent}},
+		},
+	})
+
+	if err == nil || !strings.Contains(err.Error(), "acme/looper#202 is currently held") {
+		t.Fatalf("runPublishStep() error = %v, want adopted PR hold skip", err)
+	}
+	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest != nil {
+		t.Fatalf("checkpoint.Publish = %#v, want no adopted PR persisted before hold skip", checkpoint.Publish)
+	}
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no disclosure rewrite for held adopted PR", github.updatePRBodyCalls)
+	}
+	if len(github.addLabelCalls) != 0 {
+		t.Fatalf("addLabelCalls = %#v, want no labels for held adopted PR", github.addLabelCalls)
+	}
+	if len(github.addReviewerCalls) != 0 {
+		t.Fatalf("addReviewerCalls = %#v, want no reviewers for held adopted PR", github.addReviewerCalls)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.PRNumber != nil {
+		t.Fatalf("loop = %#v, want no PR reference persisted", loop)
+	}
+}
+
+func TestRunPublishStepChecksBranchAdoptedPullRequestHoldBeforeDisclosure(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	loopID := "loop_planner_branch_adopted_pr_hold"
+	runID := "run_planner_branch_adopted_pr_hold"
+	repoPath := t.TempDir()
+	branch := "planner/42"
+	github := &fakeGitHubGateway{
+		issueDetail:      IssueDetail{Number: 42, Labels: []string{"looper:plan"}},
+		openPullRequests: []PullRequestSummary{{Number: 203, URL: "https://example/pr/203", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}},
+		prDetail:         PullRequestDetail{Number: 203, URL: "https://example/pr/203", State: "OPEN", HeadRefName: branch, BaseRefName: "main", Labels: []string{domain.HoldLabelGlobal}, Body: "## Summary\n\nExisting spec PR"},
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true)})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: loopID, Seq: 1, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopID, Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runPublishStep(context.Background(), stepInput{
+		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: repoPath},
+		Loop:      storage.LoopRecord{ID: loopID, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: stringPtr("issue:acme/looper:42"), Repo: stringPtr("acme/looper"), Status: "running"},
+		Run:       storage.RunRecord{ID: runID, LoopID: loopID},
+		QueueItem: storage.QueueItemRecord{ID: "queue_1", PayloadJSON: stringPtr(`{"issueNumber":42}`)},
+		Checkpoint: plannerCheckpoint{
+			Issue:     &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", RequestedReviewers: []string{"teammate"}},
+			Worktree:  &checkpointWorktree{Path: t.TempDir(), Branch: branch, BaseBranch: "main"},
+			WriteSpec: &checkpointWriteSpec{Status: "completed"},
+		},
+	})
+
+	if err == nil || !strings.Contains(err.Error(), "acme/looper#203 is currently held") {
+		t.Fatalf("runPublishStep() error = %v, want adopted PR hold skip", err)
+	}
+	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest != nil {
+		t.Fatalf("checkpoint.Publish = %#v, want no adopted PR persisted before hold skip", checkpoint.Publish)
+	}
+	if len(github.updatePRBodyCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls = %#v, want no disclosure rewrite for held adopted PR", github.updatePRBodyCalls)
+	}
+	if len(github.addLabelCalls) != 0 {
+		t.Fatalf("addLabelCalls = %#v, want no labels for held adopted PR", github.addLabelCalls)
+	}
+	if len(github.addReviewerCalls) != 0 {
+		t.Fatalf("addReviewerCalls = %#v, want no reviewers for held adopted PR", github.addReviewerCalls)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), loopID)
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil || loop.PRNumber != nil {
+		t.Fatalf("loop = %#v, want no PR reference persisted", loop)
+	}
+}
+
 func TestDiscoverIssuesEnqueuesAcrossProjectsForSameIssue(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -138,7 +430,7 @@ func TestDiscoverIssuesEnqueuesAcrossProjectsForSameIssue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureLoopForIssue(project_1) error = %v", err)
 	}
-	project1Queue := storage.QueueItemRecord{ID: "queue_existing", ProjectID: stringPtr("project_1"), LoopID: &loopResult.record.ID, Type: "planner", TargetType: "issue", TargetID: buildIssueTargetID("acme/looper", issue.Number), Repo: stringPtr("acme/looper"), DedupeKey: buildPlannerDedupeKey("project_1", loopResult.record.ID, "acme/looper", issue.Number), Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LockKey: stringPtr(buildIssueLockKey("acme/looper", issue.Number)), CreatedAt: nowISO, UpdatedAt: nowISO}
+	project1Queue := storage.QueueItemRecord{ID: "queue_existing", ProjectID: stringPtr("project_1"), LoopID: &loopResult.record.ID, Type: "planner", TargetType: "issue", TargetID: buildIssueTargetID("acme/looper", issue.Number), Repo: stringPtr("acme/looper"), DedupeKey: buildPlannerDedupeKey("project_1", loopResult.record.ID, "acme/looper", issue.Number), Priority: storage.QueuePriorityPlanner, Status: "queued", AvailableAt: nowISO, Attempts: 0, MaxAttempts: 3, LockKey: stringPtr(storage.IssueLockKey("project_1", "acme/looper", issue.Number)), CreatedAt: nowISO, UpdatedAt: nowISO}
 	if err := fixture.repos.Queue.Upsert(context.Background(), project1Queue); err != nil {
 		t.Fatalf("Queue.Upsert(existing) error = %v", err)
 	}
@@ -370,6 +662,86 @@ func TestRunWriteSpecStepRecreatesCheckpointOutsideWorktreeRootAndRunsAgent(t *t
 	}
 }
 
+func TestRunWriteSpecStepRechecksPlannerHoldBeforeStartingAgent(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_held"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issue.IssueNumber, Labels: []string{domain.HoldLabelGlobal}}}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now})
+
+	_, err = runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    loopResult.record,
+		Run:     storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{
+			Issue:    issue,
+			Worktree: &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"},
+		},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runWriteSpecStep() error = %v, want holdSkipError", err)
+	}
+	if !strings.Contains(holdErr.summary, "acme/looper#42") {
+		t.Fatalf("hold summary = %q, want held issue reference", holdErr.summary)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("len(agent.starts) = %d, want agent not started", len(agent.starts))
+	}
+}
+
+func TestRunWriteSpecStepRechecksPlannerHoldAfterAgentCompletion(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	worktreeRoot := t.TempDir()
+	worktreePath := filepath.Join(worktreeRoot, "wt")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	issue := &checkpointIssue{Repo: "acme/looper", IssueNumber: 42, Title: "Plan this", SpecPath: "specs/42.md"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, issue.Repo, IssueSummary{Number: issue.IssueNumber, Title: issue.Title}, buildPlannerDiscoveryFingerprint(issue.Repo, fixture.now(), IssueSummary{Number: issue.IssueNumber, Title: issue.Title}))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	runID := "run_write_spec_held_after_agent"
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: runID, LoopID: loopResult.record.ID, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issueDetails: []IssueDetail{{Number: 42}, {Number: 42, Labels: []string{domain.HoldLabelGlobal}}}}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HasUncommittedChanges: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now})
+
+	_, err = runner.runWriteSpecStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir(), MetadataJSON: &metadata},
+		Loop:    loopResult.record, Run: storage.RunRecord{ID: runID, LoopID: loopResult.record.ID},
+		Checkpoint: plannerCheckpoint{Issue: issue, Worktree: &checkpointWorktree{Path: worktreePath, Branch: "looper/planner/42-plan-this", BaseBranch: "main"}},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runWriteSpecStep() error = %v, want holdSkipError", err)
+	}
+	if len(git.inspectCalls) != 0 || len(git.commitCalls) != 0 {
+		t.Fatalf("git reconciliation calls = inspect %d, commit %d; want none", len(git.inspectCalls), len(git.commitCalls))
+	}
+}
+
 func TestProcessClaimedItemManualPlannerBypassesDiscoveryChecks(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -540,6 +912,25 @@ func TestProcessClaimedItemSuccessfulPlannerPublish(t *testing.T) {
 	}
 }
 
+func TestPlannerAdoptionHoldSummaryRechecksIssueBeforeAdoptedPullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 42, Labels: []string{domain.HoldLabelGlobal}}}
+	runner := New(Options{GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	checkpoint := plannerCheckpoint{Issue: &checkpointIssue{Repo: "acme/looper", IssueNumber: 42}}
+
+	held, summary, err := runner.plannerAdoptionHoldSummary(context.Background(), storage.ProjectRecord{RepoPath: t.TempDir()}, checkpoint, "acme/looper", 101, storage.QueueItemRecord{})
+	if err != nil {
+		t.Fatalf("plannerAdoptionHoldSummary() error = %v", err)
+	}
+	if !held || !strings.Contains(summary, "acme/looper#42") {
+		t.Fatalf("held, summary = %v, %q, want newly held source issue", held, summary)
+	}
+	if len(github.listOpenPRCalls) != 0 {
+		t.Fatalf("listOpenPRCalls = %#v, want no further PR work after issue hold", github.listOpenPRCalls)
+	}
+}
+
 func TestProcessClaimedItemUsesConfiguredPlannerPolicyLabels(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -622,6 +1013,90 @@ func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	call := github.addAssigneeCalls[0]
 	if call.Repo != "acme/looper" || call.IssueNumber != 42 || len(call.Assignees) != 1 || call.Assignees[0] != "octocat" {
 		t.Fatalf("add assignee call = %#v, want octocat on acme/looper#42", call)
+	}
+}
+
+func TestProcessClaimedItemGitHubAppSkipsSelfAssign(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issue := IssueSummary{Number: 42, Title: "Plan this"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	queueItem, err := (&Runner{repos: fixture.repos, now: fixture.now, retryMaxAttempts: 3}).enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loopResult.record.ID, Repo: "acme/looper", IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "manual": true}})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	cfg := config.Config{
+		Projects:   []config.ProjectRefConfig{{ID: "project_1", Repo: "acme/looper", Identity: "planner-bot"}},
+		Identities: map[string]config.HostingIdentityConfig{"planner-bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: "/not-read-by-fake-transports.pem"}},
+	}
+	github := &fakeGitHubGateway{login: "looper-sandbox-e2e[bot]", issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"looper:plan"}}, addAssigneeErr: fmt.Errorf("Forbidden (HTTP 403)"), createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true), CustomInstructions: &cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if claim.ID != queueItem.ID {
+		t.Fatalf("claim.ID = %q, want %q", claim.ID, queueItem.ID)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success without GitHub App self-assignment", result)
+	}
+	if len(github.addAssigneeCalls) != 0 {
+		t.Fatalf("addAssigneeCalls = %#v, want no GitHub App self-assignment", github.addAssigneeCalls)
+	}
+}
+
+func TestProcessClaimedItemGitHubAppPlaneStillSelfAssigns(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issue := IssueSummary{Number: 42, Title: "Plan this"}
+	loopResult, err := (&Runner{repos: fixture.repos, now: fixture.now}).ensureLoopForIssue(context.Background(), storage.ProjectRecord{ID: "project_1"}, "acme/looper", issue, buildPlannerDiscoveryFingerprint("acme/looper", fixture.now(), issue))
+	if err != nil {
+		t.Fatalf("ensureLoopForIssue() error = %v", err)
+	}
+	queueItem, err := (&Runner{repos: fixture.repos, now: fixture.now, retryMaxAttempts: 3}).enqueue(context.Background(), enqueueInput{ProjectID: "project_1", LoopID: loopResult.record.ID, Repo: "acme/looper", IssueNumber: issue.Number, Payload: map[string]any{"issueNumber": issue.Number, "manual": true}})
+	if err != nil {
+		t.Fatalf("enqueue() error = %v", err)
+	}
+	const planeLogin = "11111111-2222-3333-4444-555555555555"
+	cfg := config.Config{
+		Providers:  []config.ProviderConfig{{ID: "plane-open-design", Kind: config.ProviderKindPlane}},
+		Projects:   []config.ProjectRefConfig{{ID: "project_1", Provider: "plane-open-design", Repo: "acme/looper", Identity: "planner-bot"}},
+		Identities: map[string]config.HostingIdentityConfig{"planner-bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: "/not-read-by-fake-transports.pem"}},
+	}
+	github := &fakeGitHubGateway{login: planeLogin, issueDetail: IssueDetail{Number: 42, Title: "Plan this", Body: "details", URL: "https://example/issues/42", Assignees: []string{"teammate"}, Labels: []string{"looper:plan"}}, createPRResult: CreatePullRequestResult{Number: 101, URL: "https://example/pr/101"}}
+	git := &fakeGitGateway{createResult: CreateWorktreeResult{ID: "worktree_1", WorktreePath: filepath.Join(t.TempDir(), "wt"), Branch: "looper/planner/42-plan-this", BaseBranch: "main"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "wrote spec"}}}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: boolPtr(true), CustomInstructions: &cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "planner-worker-1", "planner")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	if claim.ID != queueItem.ID {
+		t.Fatalf("claim.ID = %q, want %q", claim.ID, queueItem.ID)
+	}
+	result, err := runner.ProcessClaimedItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "success" {
+		t.Fatalf("result = %#v, want success with Plane self-assignment", result)
+	}
+	if len(github.addAssigneeCalls) != 1 {
+		t.Fatalf("addAssigneeCalls = %#v, want Plane self-assignment despite GitHub App hosting identity", github.addAssigneeCalls)
+	}
+	call := github.addAssigneeCalls[0]
+	if call.Repo != "acme/looper" || call.IssueNumber != 42 || len(call.Assignees) != 1 || call.Assignees[0] != planeLogin {
+		t.Fatalf("add assignee call = %#v, want Plane login on acme/looper#42", call)
 	}
 }
 
@@ -844,7 +1319,7 @@ func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T)
 	if err != nil {
 		t.Fatalf("enqueue() error = %v", err)
 	}
-	checkpointJSON := `{"claimedLockKey":"` + buildIssueLockKey("acme/looper", issue.Number) + `"}`
+	checkpointJSON := `{"claimedLockKey":"` + storage.IssueLockKey("project_1", "acme/looper", issue.Number) + `"}`
 	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_failed_resume", LoopID: loopResult.record.ID, Status: "failed", LastCompletedStep: stringPtr(string(stepDiscoverIssues)), CheckpointJSON: &checkpointJSON, StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
 		t.Fatalf("Runs.Upsert() error = %v", err)
 	}
@@ -872,7 +1347,7 @@ func TestProcessClaimedItemResumeReleasesClaimedLockWhenSetupFails(t *testing.T)
 	if err == nil || !strings.Contains(err.Error(), "forced loop update failure") {
 		t.Fatalf("ProcessClaimedItem() error = %v, want forced loop update failure", err)
 	}
-	lockKey := buildIssueLockKey("acme/looper", issue.Number)
+	lockKey := storage.IssueLockKey("project_1", "acme/looper", issue.Number)
 	lock, err := fixture.repos.Locks.Get(context.Background(), lockKey)
 	if err != nil {
 		t.Fatalf("Locks.Get() error = %v", err)
@@ -1217,6 +1692,8 @@ type fakeGitHubGateway struct {
 	issues             []IssueSummary
 	listOpenIssueCalls []ListOpenIssuesInput
 	issueDetail        IssueDetail
+	issueDetails       []IssueDetail
+	issueDetailIndex   int
 	openPullRequests   []PullRequestSummary
 	prDetail           PullRequestDetail
 	viewPRErr          error
@@ -1242,6 +1719,10 @@ func (f *fakeGitHubGateway) ListOpenIssues(_ context.Context, input ListOpenIssu
 
 func (f *fakeGitHubGateway) ViewIssue(_ context.Context, input ViewIssueInput) (IssueDetail, error) {
 	detail := f.issueDetail
+	if f.issueDetailIndex < len(f.issueDetails) {
+		detail = f.issueDetails[f.issueDetailIndex]
+		f.issueDetailIndex++
+	}
 	if detail.Number == 0 {
 		detail.Number = input.IssueNumber
 	}

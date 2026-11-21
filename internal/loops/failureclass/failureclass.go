@@ -54,9 +54,17 @@ type BoundaryError struct {
 	Err      error
 }
 
+// WithBoundary attaches a failure boundary used by Classify when the caller's
+// context boundary is unknown. If err is already wrapped with a non-empty
+// boundary, that boundary is preserved so local construction/config failures
+// are not reclassified as external (retryable) transport boundaries.
 func WithBoundary(err error, boundary Boundary) error {
 	if err == nil {
 		return nil
+	}
+	var existing *BoundaryError
+	if errors.As(err, &existing) && existing.Boundary != "" {
+		return err
 	}
 	return &BoundaryError{Boundary: boundary, Err: err}
 }
@@ -75,16 +83,23 @@ func Classify(err error, ctx Context) Kind {
 	if githubinfra.IsTransientError(err) {
 		return RetryableTransient
 	}
-	if ctx.Boundary == BoundaryUnknown {
-		var boundaryErr *BoundaryError
-		if errors.As(err, &boundaryErr) && boundaryErr.Boundary != "" {
-			ctx.Boundary = boundaryErr.Boundary
-		}
+	// Prefer an explicit boundary attached to the error over the caller's step
+	// default. Worktree steps often default to git_remote (fetch), but local
+	// integrity failures wrap BoundaryLocalWorktree after a confirmed probe.
+	var boundaryErr *BoundaryError
+	if errors.As(err, &boundaryErr) && boundaryErr.Boundary != "" {
+		ctx.Boundary = boundaryErr.Boundary
 	}
 
 	message := strings.ToLower(githubinfra.ErrorMessage(err))
 	if message == "" {
 		message = strings.ToLower(err.Error())
+	}
+	// Concurrent createRunContext races hit idx_runs_one_running_per_loop. The
+	// durable index is correct; treat a leaked UNIQUE as retryable so it cannot
+	// park the queue in manual_intervention (issue #634).
+	if isOneRunningRunPerLoopViolation(message) {
+		return RetryableTransient
 	}
 	if isManualWorktreeMessage(message) || ctx.Boundary == BoundaryLocalWorktree {
 		return ManualIntervention
@@ -92,7 +107,7 @@ func Classify(err error, ctx Context) Kind {
 	if ctx.Boundary == BoundaryGitHubAPI && isRetryableGitHubGraphQLUnauthorized(message) {
 		return RetryableTransient
 	}
-	if isDeterministicDenial(message) || isGitHubAPIDeterministicDenial(message, ctx.Boundary) || isInternalDeterministicBoundary(ctx.Boundary) {
+	if isDeterministicDenial(message) || isGitHubAPIDeterministicDenial(err, message, ctx.Boundary) || isInternalDeterministicBoundary(ctx.Boundary) {
 		return NonRetryable
 	}
 	if isExternalBoundary(ctx.Boundary) {
@@ -119,6 +134,24 @@ func isInternalDeterministicBoundary(boundary Boundary) bool {
 	}
 }
 
+// IsOneRunningRunPerLoopViolation reports whether err is the partial unique
+// index on runs(loop_id) WHERE status='running'. Exported so runners can map
+// the conflict to a typed busy error without string-matching in three places.
+func IsOneRunningRunPerLoopViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isOneRunningRunPerLoopViolation(strings.ToLower(err.Error()))
+}
+
+func isOneRunningRunPerLoopViolation(message string) bool {
+	if !strings.Contains(message, "unique constraint failed") {
+		return false
+	}
+	return strings.Contains(message, "runs.loop_id") ||
+		strings.Contains(message, "idx_runs_one_running_per_loop")
+}
+
 func isManualWorktreeMessage(message string) bool {
 	return strings.Contains(message, "dirty worktree") ||
 		strings.Contains(message, "worktree is dirty") ||
@@ -142,9 +175,17 @@ func isDeterministicDenial(message string) bool {
 	return false
 }
 
-func isGitHubAPIDeterministicDenial(message string, boundary Boundary) bool {
+func isGitHubAPIDeterministicDenial(err error, message string, boundary Boundary) bool {
 	if boundary != BoundaryGitHubAPI {
 		return false
+	}
+	// Typed provider status codes (e.g. ForgejoHTTPError) are authoritative for
+	// permanent client failures. String "HTTP 404" alone stays retryable for
+	// GitHub CLI errors because generic REST 404s are ambiguous; missing PR
+	// targets on GitHub use "Could not resolve" instead.
+	switch httpStatusCode(err) {
+	case 400, 404, 422:
+		return true
 	}
 	for _, fragment := range []string{
 		"http 400",
@@ -157,6 +198,39 @@ func isGitHubAPIDeterministicDenial(message string, boundary Boundary) bool {
 		}
 	}
 	return false
+}
+
+// httpStatusCoder is implemented by provider HTTP errors that expose the
+// original response status without requiring string parsing (e.g. Forgejo
+// ForgejoHTTPError). Classification uses errors.As so wrapped values still
+// match.
+//
+// Trade-off (typed status classification):
+//   - Prevents: Forgejo/provider permanent client failures (400/404/422) from
+//     being treated as retryable_transient when the fixer tags them
+//     BoundaryGitHubAPI, which would requeue deleted/missing PRs forever on
+//     unlimited queues.
+//   - Cost: a second classification path beside message fragments; providers
+//     must implement HTTPStatusCode() or they fall through to string rules.
+//     Only 400/404/422 are terminal via this path — 401/403/5xx stay on
+//     existing message/boundary rules (auth denials vs transient outages).
+//   - Why not string "HTTP 404" alone: generic GitHub CLI REST 404s are
+//     ambiguous (missing issue vs missing endpoint vs temporary routing) and
+//     must stay retryable; missing GitHub PR targets use "Could not resolve"
+//     instead. Typed status is authoritative only when the provider preserves
+//     the numeric code on the error value.
+//   - Why not import provider packages here: failureclass stays free of
+//     forge/github concrete types; the small interface is the extension point.
+type httpStatusCoder interface {
+	HTTPStatusCode() int
+}
+
+func httpStatusCode(err error) int {
+	var coder httpStatusCoder
+	if errors.As(err, &coder) {
+		return coder.HTTPStatusCode()
+	}
+	return 0
 }
 
 func isRetryableGitHubGraphQLUnauthorized(message string) bool {

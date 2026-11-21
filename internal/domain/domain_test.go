@@ -88,6 +88,40 @@ func TestAssertStatusTransitions(t *testing.T) {
 	if err := AssertLoopStatusTransition(LoopStatusQueued, LoopStatusCompleted); err == nil {
 		t.Fatal("AssertLoopStatusTransition(queued, completed) error = nil, want failure")
 	}
+	if err := AssertLoopStatusTransition(LoopStatusRunning, LoopStatusAwaitingHuman); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(running, awaiting_human) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusAwaitingHuman, LoopStatusRunning); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(awaiting_human, running) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusCompleted, LoopStatusAwaitingHuman); err == nil {
+		t.Fatal("AssertLoopStatusTransition(completed, awaiting_human) error = nil, want failure")
+	}
+	if err := AssertKnownLoopStatus(LoopStatusAwaitingHuman); err != nil {
+		t.Fatalf("AssertKnownLoopStatus(awaiting_human) error = %v", err)
+	}
+	if !IsActiveLoopStatus(LoopStatusAwaitingHuman) {
+		t.Fatal("IsActiveLoopStatus(awaiting_human) = false, want true")
+	}
+	// Human takeover: reachable from running / awaiting_human; hands back to queued.
+	if err := AssertLoopStatusTransition(LoopStatusRunning, LoopStatusHumanTakeover); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(running, human_takeover) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusAwaitingHuman, LoopStatusHumanTakeover); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(awaiting_human, human_takeover) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusHumanTakeover, LoopStatusQueued); err != nil {
+		t.Fatalf("AssertLoopStatusTransition(human_takeover, queued) error = %v", err)
+	}
+	if err := AssertLoopStatusTransition(LoopStatusQueued, LoopStatusHumanTakeover); err == nil {
+		t.Fatal("AssertLoopStatusTransition(queued, human_takeover) error = nil, want failure")
+	}
+	if err := AssertKnownLoopStatus(LoopStatusHumanTakeover); err != nil {
+		t.Fatalf("AssertKnownLoopStatus(human_takeover) error = %v", err)
+	}
+	if !IsActiveLoopStatus(LoopStatusHumanTakeover) {
+		t.Fatal("IsActiveLoopStatus(human_takeover) = false, want true")
+	}
 	if err := AssertRunStatusTransition(RunStatusQueued, RunStatusRunning); err != nil {
 		t.Fatalf("AssertRunStatusTransition(queued, running) error = %v", err)
 	}
@@ -104,5 +138,34 @@ func TestAssertStepBelongsToLoopType(t *testing.T) {
 	}
 	if err := AssertStepBelongsToLoopType(LoopTypePlanner, "execute"); err == nil {
 		t.Fatal("AssertStepBelongsToLoopType(planner, execute) error = nil, want failure")
+	}
+}
+
+func TestIsAutoLaneHeld(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		loopType LoopType
+		labels   []string
+		want     bool
+	}{
+		{name: "global blocks planner", loopType: LoopTypePlanner, labels: []string{HoldLabelGlobal}, want: true},
+		{name: "planner ignores worker hold", loopType: LoopTypePlanner, labels: []string{HoldLabelWorker}, want: false},
+		{name: "worker blocked by worker hold", loopType: LoopTypeWorker, labels: []string{HoldLabelWorker}, want: true},
+		{name: "worker blocked by global hold", loopType: LoopTypeWorker, labels: []string{HoldLabelGlobal}, want: true},
+		{name: "reviewer blocked by reviewer hold", loopType: LoopTypeReviewer, labels: []string{HoldLabelReviewer}, want: true},
+		{name: "fixer blocked by fixer hold", loopType: LoopTypeFixer, labels: []string{HoldLabelFixer}, want: true},
+		{name: "no prefix matching", loopType: LoopTypeWorker, labels: []string{"looper:hold:worker:extra"}, want: false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := IsAutoLaneHeld(tt.loopType, tt.labels); got != tt.want {
+				t.Fatalf("IsAutoLaneHeld(%s, %#v) = %v, want %v", tt.loopType, tt.labels, got, tt.want)
+			}
+		})
 	}
 }

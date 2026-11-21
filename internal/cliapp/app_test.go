@@ -213,6 +213,37 @@ func TestFixCreateAcceptsLoopFlag(t *testing.T) {
 	}
 }
 
+func TestFixCreateIncludesForceFlag(t *testing.T) {
+	t.Parallel()
+	repoPath := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", repoPath, err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": repoPath, "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/loops":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["force"], true; got != want {
+				t.Fatalf("body.force = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_fix_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "queued"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "fix", "123", "--project", "project_1", "--force", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([fix 123 --force]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+}
+
 func TestPullRequestListShowsMergeabilityAndBlocker(t *testing.T) {
 	t.Parallel()
 
@@ -221,6 +252,17 @@ func TestPullRequestListShowsMergeabilityAndBlocker(t *testing.T) {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
 		writeEnvelope(t, w, pkgapi.Success("req_prs", map[string]any{"items": []map[string]any{{
+			"projectId":      "github",
+			"repo":           "acme/looper",
+			"prNumber":       42,
+			"title":          "Fix queue visibility",
+			"mergeability":   "blocked",
+			"blockingReason": "checks",
+			"reviewState":    "APPROVED",
+			"checksSummary":  "FAILURE",
+			"reviewer":       "completed",
+		}, {
+			"projectId":      "forgejo",
 			"repo":           "acme/looper",
 			"prNumber":       42,
 			"title":          "Fix queue visibility",
@@ -238,10 +280,41 @@ func TestPullRequestListShowsMergeabilityAndBlocker(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("Run([pr list]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	for _, want := range []string{"mergeability", "blocker", "blocked", "checks"} {
+	for _, want := range []string{"project", "github", "forgejo", "mergeability", "blocker", "blocked", "checks"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout = %q, want to contain %q", stdout, want)
 		}
+	}
+}
+
+func TestPullRequestShowAndStatusPassProjectSelection(t *testing.T) {
+	t.Parallel()
+
+	for _, command := range []string{"show", "status"} {
+		command := command
+		t.Run(command, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				wantPath := "/api/v1/pull-requests/acme%2Flooper/42"
+				if command == "status" {
+					wantPath += "/status"
+				}
+				if got := r.URL.EscapedPath(); got != wantPath {
+					t.Fatalf("request path = %q, want %q", got, wantPath)
+				}
+				if got := r.URL.Query().Get("projectId"); got != "forgejo" {
+					t.Fatalf("projectId = %q, want forgejo", got)
+				}
+				writeEnvelope(t, w, pkgapi.Success("req_pr", map[string]any{"projectId": "forgejo", "repo": "acme/looper", "prNumber": 42, "reviewState": "OPEN"}))
+			}))
+			defer server.Close()
+
+			configPath := writeCLIConfig(t, server.URL, "")
+			exitCode, _, stderr := runApp(t, "pr", command, "acme/looper#42", "--project", "forgejo", "--config", configPath)
+			if exitCode != 0 {
+				t.Fatalf("Run([pr %s]) exit code = %d, want 0; stderr=%q", command, exitCode, stderr)
+			}
+		})
 	}
 }
 
@@ -256,17 +329,18 @@ func TestRunReconcileStaleOutputsHumanAndJSON(t *testing.T) {
 			t.Fatalf("request method = %q, want %q", got, want)
 		}
 		writeEnvelope(t, w, pkgapi.Success("req_reconcile", map[string]any{
-			"mode":                 "manual",
-			"candidateRuns":        2,
-			"interruptedRuns":      1,
-			"loopsRequeued":        1,
-			"queueItemsRequeued":   1,
-			"queueItemsCancelled":  0,
-			"cleanedExecutions":    1,
-			"skippedUncertainRuns": 0,
-			"runIds":               []string{"run_1"},
-			"loopIds":              []string{"loop_1"},
-			"executionIds":         []string{"exec_1"},
+			"mode":                  "manual",
+			"candidateRuns":         2,
+			"interruptedRuns":       1,
+			"loopsRequeued":         1,
+			"queueItemsRequeued":    1,
+			"queueItemsCancelled":   0,
+			"cleanedExecutions":     0,
+			"quarantinedExecutions": 1,
+			"skippedUncertainRuns":  0,
+			"runIds":                []string{"run_1"},
+			"loopIds":               []string{"loop_1"},
+			"executionIds":          []string{"exec_1"},
 		}))
 	}))
 	defer server.Close()
@@ -382,7 +456,7 @@ func TestLabelsInitDryRunPrintsPlannedChanges(t *testing.T) {
 	if stderr.Len() != 0 {
 		t.Fatalf("Run(labels init --dry-run) stderr = %q, want empty string", stderr.String())
 	}
-	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:spec-reviewing", "created looper:spec-ready", "Summary: created=3 updated=0 skipped=1 failed=0"} {
+	for _, want := range []string{"Previewing Looper labels for acme/looper", "skipped looper:plan", "created looper:spec-reviewing", "created looper:hold", "created looper:hold:reviewer", "Summary: created=7 updated=0 skipped=1 failed=0"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q, want to contain %q", stdout.String(), want)
 		}
@@ -456,6 +530,14 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 				return commandExecutionResult{Stdout: "{}"}, nil
 			case "label create looper:needs-human --repo acme/looper --color d93f0b --description Looper requires manual intervention":
 				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:hold --repo acme/looper --color b60205 --description Block all automatic Looper activity for this issue or PR":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:hold:worker --repo acme/looper --color b60205 --description Block automatic worker activity for this issue or PR":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:hold:fixer --repo acme/looper --color b60205 --description Block automatic fixer activity for this issue or PR":
+				return commandExecutionResult{Stdout: "{}"}, nil
+			case "label create looper:hold:reviewer --repo acme/looper --color b60205 --description Block automatic reviewer activity for this issue or PR":
+				return commandExecutionResult{Stdout: "{}"}, nil
 			default:
 				t.Fatalf("unexpected command args: %s", strings.Join(args, " "))
 				return commandExecutionResult{}, nil
@@ -470,7 +552,7 @@ func TestLabelsInitFailsAndPrintsGHStderrWhenMutationFails(t *testing.T) {
 	if !strings.Contains(stdout.String(), "failed looper:spec-reviewing: gh exited with code 1: GraphQL: Resource not accessible by integration") {
 		t.Fatalf("stdout = %q, want failed label with gh stderr", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "Summary: created=2 updated=0 skipped=1 failed=1") {
+	if !strings.Contains(stdout.String(), "Summary: created=6 updated=0 skipped=1 failed=1") {
 		t.Fatalf("stdout = %q, want failed summary", stdout.String())
 	}
 	if !strings.Contains(stderr.String(), "initialize labels for acme/looper: 1 label mutation(s) failed") {
@@ -1087,6 +1169,9 @@ func TestExtractConfigArgsForwardsCanonicalConfigFlags(t *testing.T) {
 		"--roles-reviewer-discovery-triggers-enable-self-review",
 		"true",
 		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--defaults-loop-quiet-period-seconds",
+		"90",
+		"--roles-fixer-behavior-loop-quiet-period-seconds=30",
 		"--instructions-enabled=true",
 		"--project",
 		"demo",
@@ -1100,6 +1185,9 @@ func TestExtractConfigArgsForwardsCanonicalConfigFlags(t *testing.T) {
 		"--roles-reviewer-discovery-triggers-enable-self-review",
 		"true",
 		"--roles-reviewer-behavior-loop-enabled-by-default=false",
+		"--defaults-loop-quiet-period-seconds",
+		"90",
+		"--roles-fixer-behavior-loop-quiet-period-seconds=30",
 		"--instructions-enabled=true",
 	}
 
@@ -2305,6 +2393,77 @@ func TestConfigShowSourceDetectsFixerAuthorFilterCLIOverride(t *testing.T) {
 	assertConfigFieldSource(t, stdout, "roles.fixer.triggers.authorFilter", "cli")
 }
 
+func TestConfigShowSourceDetectsQuietPeriodConfigFileAndCLI(t *testing.T) {
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"defaults": map[string]any{
+			"loop": map[string]any{
+				"quietPeriodSeconds": 90,
+			},
+		},
+		"roles": map[string]any{
+			"fixer": map[string]any{
+				"behavior": map[string]any{
+					"loop": map[string]any{
+						"quietPeriodSeconds": 15,
+					},
+				},
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "config-file")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "config-file")
+
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source",
+		"--defaults-loop-quiet-period-seconds=120",
+		"--roles-fixer-behavior-loop-quiet-period-seconds=45",
+		"--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source with quiet-period flags]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "cli")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "cli")
+}
+
+func TestConfigShowSourceAttributesInheritedFixerQuietPeriod(t *testing.T) {
+	// Only defaults.loop is set; fixer inherits 120 but must report the shared source.
+	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
+		"notifications": map[string]any{
+			"osascript": map[string]any{"enabled": false},
+		},
+		"defaults": map[string]any{
+			"loop": map[string]any{
+				"quietPeriodSeconds": 120,
+			},
+		},
+	})
+
+	exitCode, stdout, stderr := runApp(t, "config", "show", "--source", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "config-file")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "config-file")
+	assertConfigFieldValue(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", float64(120))
+
+	exitCode, stdout, stderr = runApp(t, "config", "show", "--source",
+		"--defaults-loop-quiet-period-seconds=45",
+		"--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([config show --source with defaults quiet flag]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	assertConfigFieldSource(t, stdout, "defaults.loop.quietPeriodSeconds", "cli")
+	assertConfigFieldSource(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", "cli")
+	assertConfigFieldValue(t, stdout, "roles.fixer.behavior.loop.quietPeriodSeconds", float64(45))
+}
+
 func TestConfigShowSourceDetectsCanonicalReviewerDiscoveryEnvOverrides(t *testing.T) {
 	configPath := writeEditableCLIConfigWithPayload(t, map[string]any{
 		"notifications": map[string]any{
@@ -2648,6 +2807,22 @@ func TestConfigSetWarnsWhenFlagOverridesWrittenValue(t *testing.T) {
 
 func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
 	t.Helper()
+	field := configShowSourceField(t, stdout, key)
+	if got := field["source"]; got != wantSource {
+		t.Fatalf("%s source = %#v, want %#v", key, got, wantSource)
+	}
+}
+
+func assertConfigFieldValue(t *testing.T, stdout, key string, wantValue any) {
+	t.Helper()
+	field := configShowSourceField(t, stdout, key)
+	if got := field["value"]; got != wantValue {
+		t.Fatalf("%s value = %#v, want %#v", key, got, wantValue)
+	}
+}
+
+func configShowSourceField(t *testing.T, stdout, key string) map[string]any {
+	t.Helper()
 	var decoded map[string]any
 	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
 		t.Fatalf("unmarshal source output: %v", err)
@@ -2660,9 +2835,7 @@ func assertConfigFieldSource(t *testing.T, stdout, key, wantSource string) {
 	if !ok {
 		t.Fatalf("%s = %#v, want object", key, fields[key])
 	}
-	if got := field["source"]; got != wantSource {
-		t.Fatalf("%s source = %#v, want %#v", key, got, wantSource)
-	}
+	return field
 }
 
 func TestConfigValidatePrintsLegacyDefaultConfigMigrationNote(t *testing.T) {
@@ -3169,7 +3342,7 @@ func TestProjectListWithoutJSONPrintsTable(t *testing.T) {
 		if got, want := r.URL.Path, "/api/v1/projects"; got != want {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
-		writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repo", "baseBranch": "main", "provider": "github", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
 	}))
 	defer server.Close()
 
@@ -3181,7 +3354,7 @@ func TestProjectListWithoutJSONPrintsTable(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([project list]) stderr = %q, want empty string", stderr)
 	}
-	for _, want := range []string{"id", "repoPath", "project_1", "/tmp/repo", "acme/looper"} {
+	for _, want := range []string{"id", "repoPath", "provider", "project_1", "/tmp/repo", "github", "acme/looper"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("Run([project list]) stdout = %q, want to contain %q", stdout, want)
 		}
@@ -3313,6 +3486,45 @@ func TestPSWithoutJSONShowsDisplayStatusWhenPresent(t *testing.T) {
 	}
 	if strings.Contains(stdout, "queued") {
 		t.Fatalf("Run([ps]) stdout = %q, did not expect fallback status %q when displayStatus is present", stdout, "queued")
+	}
+}
+
+func TestPSWithoutJSONShowsTruncatedFailureReason(t *testing.T) {
+	t.Parallel()
+
+	longReason := "fatal: worktree is locked and cannot be cleaned automatically without operator review of local changes"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/api/v1/runs/active"; got != want {
+			t.Fatalf("request path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_active_runs", map[string]any{"items": []map[string]any{{
+			"seq":               9,
+			"type":              "worker",
+			"status":            "paused",
+			"displayStatus":     "manual_intervention",
+			"lastFailureReason": longReason,
+			"currentStep":       "prepare_work",
+			"target":            map[string]any{"label": "Looper"},
+		}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "ps", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([ps]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([ps]) stderr = %q, want empty string", stderr)
+	}
+	if !strings.Contains(stdout, "manual_intervention") {
+		t.Fatalf("Run([ps]) stdout = %q, want display status manual_intervention", stdout)
+	}
+	if !strings.Contains(stdout, "fatal: worktree is locked") || !strings.Contains(stdout, "...") {
+		t.Fatalf("Run([ps]) stdout = %q, want truncated failure reason", stdout)
+	}
+	if strings.Contains(stdout, longReason) {
+		t.Fatalf("Run([ps]) stdout = %q, did not expect full untruncated failure reason", stdout)
 	}
 }
 
@@ -3453,6 +3665,80 @@ func TestCloseWithoutJSONUsesCloseRoute(t *testing.T) {
 	}
 }
 
+func TestStopWithoutJSONPrintsPausedOnlyOutcomeTruthfully(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Method, http.MethodPost; got != want {
+			t.Fatalf("method = %q, want %q", got, want)
+		}
+		if got, want := r.URL.Path, "/api/v1/runs/active/12/stop"; got != want {
+			t.Fatalf("path = %q, want %q", got, want)
+		}
+		writeEnvelope(t, w, pkgapi.Success("req_stop", map[string]any{"stopped": true, "loopId": "loop_12", "outcome": "paused_only", "processSkipReason": "pid_verification_rejected"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "12", "--config", configPath)
+	if exitCode != 0 {
+		t.Fatalf("Run([stop 12]) exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("Run([stop 12]) stderr = %q, want empty string", stderr)
+	}
+	for _, want := range []string{"Loop paused only", "loop_12", "paused_only", "pid_verification_rejected"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([stop 12]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "Loop stopped") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want paused-only title instead of plain stopped", stdout)
+	}
+}
+
+func TestStopWithoutJSONPrintsAlreadyStoppingOutcomeTruthfully(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop", map[string]any{"stopped": true, "loopId": "loop_12", "outcome": "already_stopping", "processSkipReason": "execution_already_stopping"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "12", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([stop 12]) = (%d, %q), want success with empty stderr", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Loop already stopping") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want already-stopping title", stdout)
+	}
+	if strings.Contains(stdout, "Loop stopped") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want non-success title", stdout)
+	}
+}
+
+func TestStopWithoutJSONPrintsAlreadyFinishedOutcomeTruthfully(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop", map[string]any{"stopped": true, "loopId": "loop_12", "outcome": "already_finished", "processSkipReason": "execution_already_finished"}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "12", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([stop 12]) = (%d, %q), want success with empty stderr", exitCode, stderr)
+	}
+	if !strings.Contains(stdout, "Loop already finished") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want already-finished title", stdout)
+	}
+	if strings.Contains(stdout, "Loop stopped") {
+		t.Fatalf("Run([stop 12]) stdout = %q, want non-success title", stdout)
+	}
+}
+
 func TestStopAllWithoutJSONPrintsNoRunningWorkMessage(t *testing.T) {
 	t.Parallel()
 
@@ -3474,6 +3760,32 @@ func TestStopAllWithoutJSONPrintsNoRunningWorkMessage(t *testing.T) {
 	}
 }
 
+func TestStopAllWithoutJSONReturnsNonZeroForPausedOnlyItems(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEnvelope(t, w, pkgapi.Success("req_stop_all_partial", map[string]any{"summary": map[string]any{"total": 1, "stopped": 0, "pausedOnly": 1, "alreadyFinished": 0, "alreadyStopping": 0, "failed": 0}, "items": []map[string]any{{"seq": 1, "type": "worker", "loopId": "loop_1", "runId": "run_1", "executionId": "exec_1", "result": "pausedOnly", "outcome": "paused_only", "processSkipReason": "pid_verification_rejected"}}}))
+	}))
+	defer server.Close()
+
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, stdout, stderr := runApp(t, "stop", "all", "--config", configPath)
+	if exitCode == 0 {
+		t.Fatalf("Run([stop all]) exit code = 0, want non-zero for paused-only partial outcome")
+	}
+	if !strings.Contains(stderr, "paused 1 task(s) without signaling a verified process") {
+		t.Fatalf("Run([stop all]) stderr = %q, want paused-only partial error", stderr)
+	}
+	for _, want := range []string{"Stop results", "pausedOnly", "paused_only", "pid_verification_rejected"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("Run([stop all]) stdout = %q, want to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "Stopped running tasks") {
+		t.Fatalf("Run([stop all]) stdout = %q, want non-full-success heading", stdout)
+	}
+}
+
 func TestStopAllWithoutJSONReturnsNonZeroForPartialFailure(t *testing.T) {
 	t.Parallel()
 
@@ -3487,7 +3799,7 @@ func TestStopAllWithoutJSONReturnsNonZeroForPartialFailure(t *testing.T) {
 	if exitCode == 0 {
 		t.Fatal("Run([stop all]) exit code = 0, want non-zero")
 	}
-	if !strings.Contains(stdout, "Stopped running tasks") || !strings.Contains(stdout, "signal failed") {
+	if !strings.Contains(stdout, "Stop results") || !strings.Contains(stdout, "signal failed") {
 		t.Fatalf("Run([stop all]) stdout = %q, want summary and failure row", stdout)
 	}
 	if !strings.Contains(stderr, "failed to stop 1 running task(s)") {
@@ -3888,11 +4200,12 @@ func TestLogsHelpIncludesFollowFlag(t *testing.T) {
 func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
 	t.Parallel()
 
+	worktreePath := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.URL.Path, "/api/v1/runs/active/12"; got != want {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
-		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": "/tmp/worktree"}}))
+		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": worktreePath}}))
 	}))
 	defer server.Close()
 
@@ -3904,7 +4217,7 @@ func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([jump 12]) stderr = %q, want empty string", stderr)
 	}
-	if got, want := stdout, "cd -- '/tmp/worktree'\n"; got != want {
+	if got, want := stdout, "cd -- "+quoteShellArg(worktreePath)+"\n"; got != want {
 		t.Fatalf("Run([jump 12]) stdout = %q, want %q", got, want)
 	}
 }
@@ -3912,11 +4225,12 @@ func TestJumpWithoutJSONPrintsShellChangeDir(t *testing.T) {
 func TestJumpWithPrintPathPrintsWorktreePath(t *testing.T) {
 	t.Parallel()
 
+	worktreePath := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.URL.Path, "/api/v1/runs/active/12"; got != want {
 			t.Fatalf("request path = %q, want %q", got, want)
 		}
-		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": "/tmp/worktree"}}))
+		writeEnvelope(t, w, pkgapi.Success("req_active_run", map[string]any{"seq": 12, "loopId": "loop_12", "projectId": "project_1", "worktree": map[string]any{"path": worktreePath}}))
 	}))
 	defer server.Close()
 
@@ -3928,7 +4242,7 @@ func TestJumpWithPrintPathPrintsWorktreePath(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("Run([jump 12 --print-path]) stderr = %q, want empty string", stderr)
 	}
-	if got, want := stdout, "/tmp/worktree\n"; got != want {
+	if got, want := stdout, worktreePath+"\n"; got != want {
 		t.Fatalf("Run([jump 12 --print-path]) stdout = %q, want %q", got, want)
 	}
 }
@@ -4091,6 +4405,33 @@ func TestReviewRepairPostsReviewerRepairRequest(t *testing.T) {
 	}
 }
 
+func TestReviewCreateIncludesForceFlag(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/projects":
+			writeEnvelope(t, w, pkgapi.Success("req_projects", map[string]any{"items": []map[string]any{{"id": "project_1", "name": "Looper", "repoPath": "/tmp/repos/looper", "repo": "acme/looper", "updatedAt": "2026-04-20T10:00:00.000Z"}}}))
+		case "/api/v1/loops":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["force"], true; got != want {
+				t.Fatalf("body.force = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_loop", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "prNumber": 123, "status": "running"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "review", "123", "--project", "project_1", "--force", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([review 123 --force]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+}
+
 func TestWorkCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 	t.Parallel()
 
@@ -4225,6 +4566,31 @@ func TestWorkCreateIssuePrintsReusedWorkerMessage(t *testing.T) {
 	}
 }
 
+func TestWorkCreateIssueIncludesForceFlag(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/workers":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request body: %v", err)
+			}
+			if got, want := body["force"], true; got != want {
+				t.Fatalf("body.force = %#v, want %#v", got, want)
+			}
+			writeEnvelope(t, w, pkgapi.Success("req_worker", map[string]any{"id": "loop_1", "projectId": "project_1", "repo": "acme/looper", "status": "queued", "issueNumber": 54, "title": "Implement issue #54", "baseBranch": "main"}))
+		default:
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	configPath := writeCLIConfig(t, server.URL, "")
+	exitCode, _, stderr := runApp(t, "work", "--issue", "54", "--project", "project_1", "--force", "--config", configPath)
+	if exitCode != 0 || stderr != "" {
+		t.Fatalf("Run([work --issue 54 --force]) = (%d, %q), want (0, empty)", exitCode, stderr)
+	}
+}
+
 func TestPlanCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 	t.Parallel()
 
@@ -4251,6 +4617,9 @@ func TestPlanCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 			if got, want := body["issueNumber"], float64(54); got != want {
 				t.Fatalf("body.issueNumber = %#v, want %#v", got, want)
 			}
+			if got, want := body["force"], true; got != want {
+				t.Fatalf("body.force = %#v, want %#v", got, want)
+			}
 			writeEnvelope(t, w, pkgapi.Success("req_planner", map[string]any{"id": "planner_1", "projectId": "project_1", "issueNumber": 54, "status": "queued"}))
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.Path)
@@ -4269,7 +4638,7 @@ func TestPlanCreateIssueResolvesProjectFromCurrentProject(t *testing.T) {
 		},
 	})
 
-	exitCode := app.Run(context.Background(), []string{"plan", "--issue", "54", "--config", configPath})
+	exitCode := app.Run(context.Background(), []string{"plan", "--issue", "54", "--force", "--config", configPath})
 	if exitCode != 0 {
 		t.Fatalf("Run([plan --issue 54]) exit code = %d, want 0", exitCode)
 	}
@@ -4539,7 +4908,10 @@ func TestInProcessSmokeWorkerWorkflowSucceedsWithManualPROpeningAndMutatesWorktr
 						Params: cfg.Agent.Params,
 						Env:    cfg.Agent.Env,
 					},
-					Repos: services.Repositories,
+					// Match production: agent.params are owned by agent.vendor so
+					// effectiveConfig keeps command/args for same-vendor custom runs.
+					ParamsOwnerVendor: cfg.Agent.Vendor,
+					Repos:             services.Repositories,
 				})},
 				AllowAutoCommit: true,
 				OpenPRStrategy:  config.OpenPRStrategyManual,

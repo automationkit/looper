@@ -2,12 +2,17 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,15 +24,22 @@ import (
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/fixer"
 	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	gitinfra "github.com/nexu-io/looper/internal/infra/git"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/notify"
+	"github.com/nexu-io/looper/internal/infra/shell"
+	"github.com/nexu-io/looper/internal/loops"
+	"github.com/nexu-io/looper/internal/loops/failureclass"
 	networkclient "github.com/nexu-io/looper/internal/network/client"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/planner"
+	"github.com/nexu-io/looper/internal/processcontainment"
+	"github.com/nexu-io/looper/internal/projects"
 	"github.com/nexu-io/looper/internal/reviewer"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/version"
 	"github.com/nexu-io/looper/internal/webhookforward"
 	"github.com/nexu-io/looper/internal/worker"
 )
@@ -75,12 +87,23 @@ type schedulerAsyncRunner interface {
 }
 
 type defaultSchedulerTickInput struct {
-	Repos                    *storage.Repositories
-	GitHubGateway            *githubinfra.Gateway
-	Logger                   bootstrap.Logger
-	Now                      func() time.Time
-	MaxConcurrentRuns        int
-	ClaimMu                  *sync.Mutex
+	Repos             *storage.Repositories
+	DB                *sql.DB
+	GitHubGateway     *githubinfra.Gateway
+	Logger            bootstrap.Logger
+	Now               func() time.Time
+	MaxConcurrentRuns int
+	ClaimMu           *sync.Mutex
+	ClaimBoundary     *sync.RWMutex
+	RefreshForClaim   func() defaultSchedulerTickInput
+	// AllowClaim, when set, is the admission projection for all work-producing
+	// scheduler activity: the full default tick (discovery, HITL, claims,
+	// stale-reconcile) and each durable ClaimNext*. Nil means ungated (tests).
+	AllowClaim func() error
+	// OperationOwner, when set, admits a Supervisor operation lease before each
+	// durable ClaimNext* and holds it until durable complete/cancel/requeue
+	// (ADR-0015 R6 / #579). Nil means ungated claim ownership (unit tests).
+	OperationOwner           *ActiveExecutionRegistry
 	ReconcileStaleRuns       func(context.Context) (StaleRunReconcileSummary, error)
 	AsyncRunner              schedulerAsyncRunner
 	RequestSchedulerWake     func()
@@ -96,12 +119,75 @@ type defaultSchedulerTickInput struct {
 	ReviewerDiscoveryEnabled *bool
 	FixerDiscoveryEnabled    *bool
 	WorkerDiscoveryEnabled   *bool
+	// OnHITLAsk is the exact transport callback captured by the snapshot's
+	// worker runner. Keeping it beside the answer callback makes the snapshot
+	// ownership boundary explicit and testable end to end.
+	OnHITLAsk worker.HITLNotifyFunc
+	// OnHITLAnswerDelivered, when set, is called after a Feishu HITL answer is
+	// delivered to a loop, so the transport can mark the ask card resolved.
+	OnHITLAnswerDelivered func(context.Context, string, string)
+	// NotifyHumanAttention, when set, observes durable loop/queue state after a
+	// claim finishes and emits a best-effort action_required notification when
+	// the loop newly entered awaiting_human or manual_intervention.
+	NotifyHumanAttention func(context.Context, string)
+	// DrainHITLPair stops live pair agents before a scope Stop answer is
+	// applied by GitHub/Feishu poll. Optional; tests may inject a recorder.
+	DrainHITLPair func(context.Context, storage.LoopRecord) error
+	// ActiveExecutions reopens sticky pair spawn gates when a scope Stop drain
+	// loses to a concurrent Continue.
+	ActiveExecutions *ActiveExecutionRegistry
 }
 
 type defaultSchedulerHandlers struct {
-	tick    RunSchedulerTickFunc
-	claim   RunSchedulerTickFunc
-	webhook WebhookForwarder
+	tick                 RunSchedulerTickFunc
+	claim                RunSchedulerTickFunc
+	webhook              WebhookForwarder
+	reviewer             reviewerScheduler
+	fixer                fixerScheduler
+	input                func(Services) defaultSchedulerTickInput
+	snapshot             func() defaultSchedulerHandlers
+	notificationGateways *schedulerNotificationGatewayFactory
+}
+
+type catalogWebhookReviewer struct {
+	snapshot func() reviewerScheduler
+}
+
+func (r catalogWebhookReviewer) DiscoverPullRequest(ctx context.Context, input reviewer.TargetedDiscoveryInput) (reviewer.DiscoveryResult, error) {
+	if r.snapshot == nil {
+		return reviewer.DiscoveryResult{}, fmt.Errorf("reviewer is not configured")
+	}
+	reviewerRunner := r.snapshot()
+	if reviewerRunner == nil {
+		return reviewer.DiscoveryResult{}, fmt.Errorf("reviewer agent is not configured")
+	}
+	return reviewerRunner.DiscoverPullRequest(ctx, input)
+}
+
+type catalogWebhookFixer struct {
+	snapshot func() fixerScheduler
+}
+
+func (f catalogWebhookFixer) DiscoverPullRequest(ctx context.Context, input fixer.TargetedDiscoveryInput) (fixer.DiscoveryResult, error) {
+	if f.snapshot == nil {
+		return fixer.DiscoveryResult{}, fmt.Errorf("fixer is not configured")
+	}
+	fixerRunner := f.snapshot()
+	if fixerRunner == nil {
+		return fixer.DiscoveryResult{}, fmt.Errorf("fixer agent is not configured")
+	}
+	return fixerRunner.DiscoverPullRequest(ctx, input)
+}
+
+func (f catalogWebhookFixer) DiscoverPullRequestsForBaseBranchUpdate(ctx context.Context, input fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error) {
+	if f.snapshot == nil {
+		return fixer.DiscoveryResult{}, fmt.Errorf("fixer is not configured")
+	}
+	fixerRunner := f.snapshot()
+	if fixerRunner == nil {
+		return fixer.DiscoveryResult{}, fmt.Errorf("fixer agent is not configured")
+	}
+	return fixerRunner.DiscoverPullRequestsForBaseBranchUpdate(ctx, input)
 }
 
 type schedulerTaskTracker struct{ wg sync.WaitGroup }
@@ -176,6 +262,117 @@ type plannerGitHubAdapter struct {
 	config  *config.Config
 }
 
+// providerTrustedEnv collects configured provider tokenEnv values from the
+// daemon process environment so the trusted looper shim can inject them into
+// real `looper` child processes without exposing secrets to agent envs.
+func providerTrustedEnv(cfg config.Config) map[string]string {
+	env := map[string]string{}
+	for _, provider := range cfg.Providers {
+		if provider.TokenEnv == nil {
+			continue
+		}
+		key := strings.TrimSpace(*provider.TokenEnv)
+		if key == "" {
+			continue
+		}
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			env[key] = value
+		}
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
+}
+
+// trustedReviewChildEnv captures the environment that a run-bound review-submit
+// child needs. Agent.Env is already visible to that run's agent process, so
+// forwarding the same captured values to the trusted child does not widen agent
+// access and preserves config-only GitHub auth such as GH_TOKEN. Provider token
+// values sourced from the daemon environment win on collisions and remain
+// available only to the trusted child.
+func trustedReviewChildEnv(cfg config.Config) map[string]string {
+	env := make(map[string]string, len(cfg.Agent.Env))
+	for key, value := range cfg.Agent.Env {
+		env[key] = value
+	}
+	for key, value := range providerTrustedEnv(cfg) {
+		env[key] = value
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
+}
+
+// resolveTrustedLooperCLIPath returns the agent-facing looper CLI path.
+// Agents always receive the real configured looper path — never a secret-bearing
+// wrapper path. Provider tokens for `looper review submit` are supplied through
+// a per-run daemon-side trusted review proxy socket bound to the selected PR.
+func resolveTrustedLooperCLIPath(cfg config.Config) string {
+	return strings.TrimSpace(derefString(cfg.Tools.LooperPath))
+}
+
+// mintTrustedReviewProxyForPR starts a daemon-side Unix socket that runs
+// `looper review submit` with captured credentials, bound exclusively to
+// allowedPRRef (owner/repo#N), allowedCwd (daemon-selected worktree), the
+// materialized run config snapshot, and the daemon-selected review-events
+// policy. Agents only receive the socket path (not tokens or snapshot path).
+// trustedEnv may be empty when ambient credential stores suffice. Setup fails
+// closed: callers must not fall back to direct review submit. cleanup stops the
+// listener and must run when the agent execution ends.
+//
+// tracker registers Supervisor-owned review-submit children for shutdown drain
+// / retain-storage (#577). Nil is allowed only in tests.
+func mintTrustedReviewProxyForPR(realLooper string, trustedEnv map[string]string, allowedPRRef, allowedCwd string, configSnapshot config.Config, policy forge.TrustedReviewProxyPolicy, tracker processcontainment.LiveTracker) (sockPath string, cleanup func(), err error) {
+	realLooper = strings.TrimSpace(realLooper)
+	allowedPRRef = strings.TrimSpace(allowedPRRef)
+	allowedCwd = strings.TrimSpace(allowedCwd)
+	if realLooper == "" {
+		return "", nil, fmt.Errorf("trusted looper path is required")
+	}
+	if allowedPRRef == "" {
+		return "", nil, fmt.Errorf("daemon-selected pull request is required")
+	}
+	if allowedCwd == "" {
+		return "", nil, fmt.Errorf("daemon-selected working directory is required")
+	}
+	resolvedLooper, err := exec.LookPath(realLooper)
+	if err != nil {
+		return "", nil, fmt.Errorf("resolve trusted looper path %q: %w", realLooper, err)
+	}
+	resolvedLooper, err = filepath.Abs(resolvedLooper)
+	if err != nil {
+		return "", nil, fmt.Errorf("make trusted looper path absolute: %w", err)
+	}
+	return forge.StartTrustedReviewProxy(resolvedLooper, trustedEnv, allowedPRRef, allowedCwd, configSnapshot, policy, tracker)
+}
+
+// forgejoClientForContext uses the captured target before any legacy provider
+// lookup, including credential-less bot-only providers and same-slug repos.
+func forgejoClientForContext(ctx context.Context, cfg *config.Config, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	if session, selected := hostingidentity.FromContext(ctx); selected {
+		if session.Kind() != config.HostingIdentityForgejoToken {
+			return nil, false, nil
+		}
+		target := session.Target()
+		if strings.TrimSpace(repo) == "" {
+			repo = target.Repo
+		}
+		provider := config.ProviderConfig{ID: target.ProviderID, Kind: config.ProviderKindForgejo, BaseURL: target.BaseURL}
+		client, err := forge.NewForgejoClientForContext(ctx, provider, strings.TrimSpace(repo))
+		return client, true, err
+	}
+	return forgeClientForLocation(cfg, repo, cwd, forgejoClientForCWD, forgejoClientForRepo)
+}
+
+func forgejoClientForIssueContext(ctx context.Context, cfg *config.Config, repo, cwd string) (*forge.ForgejoClient, bool, error) {
+	if _, selected := hostingidentity.FromContext(ctx); selected {
+		return forgejoClientForContext(ctx, cfg, repo, cwd)
+	}
+	return forgejoClientForIssueLookup(cfg, repo, cwd)
+}
+
 func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient, bool, error) {
 	provider, ok, err := forgejoProviderForRepo(cfg, repo)
 	if !ok || err != nil {
@@ -186,6 +383,126 @@ func forgejoClientForRepo(cfg *config.Config, repo string) (*forge.ForgejoClient
 		return nil, true, err
 	}
 	return client, true, nil
+}
+
+// forgejoReviewerDiscoveryLabelsForRepo returns configured reviewer trigger
+// labels for a Forgejo project. Used as a discovery fallback when native
+// requested_reviewers alone is insufficient (label-triggered discovery or
+// instances without requested_reviewers support).
+func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo, cwd string) []string {
+	if cfg == nil {
+		return nil
+	}
+	repo = strings.TrimSpace(repo)
+	if strings.TrimSpace(cwd) != "" {
+		for _, project := range cfg.Projects {
+			if cwdBelongsToProject(project, cwd) {
+				return forgejoReviewerDiscoveryLabelsForProject(*cfg, project)
+			}
+		}
+	}
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return nil
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		return forgejoReviewerDiscoveryLabelsForProject(*cfg, *matched)
+	}
+	return nil
+}
+
+func forgejoReviewerDiscoveryLabelsForProject(cfg config.Config, project config.ProjectRefConfig) []string {
+	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+		return nil
+	}
+	labels := config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.Labels
+	result := make([]string, 0, len(labels))
+	for _, label := range labels {
+		label = strings.TrimSpace(label)
+		if label != "" {
+			result = append(result, label)
+		}
+	}
+	return result
+}
+
+// addForgejoPullRequestReviewers requests native reviewers and, when the project
+// is label-triggered, also applies discovery trigger labels so reviewer
+// auto-discovery still matches. If native request fails but labels are
+// configured, labels alone keep compatibility instances working.
+// When native request succeeds on a native-request-triggered project
+// (requireReviewRequest=true), label application is best-effort because
+// requested_reviewers already makes the PR discoverable. Label failure remains
+// fatal for label-triggered projects (requireReviewRequest=false with trigger
+// labels): discovery still filters by labels, so a missing label would leave
+// the handoff permanently undiscoverable if publish marked it done.
+func addForgejoPullRequestReviewers(ctx context.Context, client *forge.ForgejoClient, cfg *config.Config, repo string, prNumber int64, reviewers []string, cwd string) error {
+	labels := forgejoReviewerDiscoveryLabelsForRepo(cfg, repo, cwd)
+	nativeErr := client.AddPullRequestReviewers(ctx, prNumber, reviewers)
+	if nativeErr != nil && len(labels) == 0 {
+		return nativeErr
+	}
+	if len(labels) > 0 {
+		if _, err := client.AddIssueLabels(ctx, prNumber, labels); err != nil {
+			if nativeErr != nil {
+				return fmt.Errorf("forgejo native review request failed (%v); label fallback also failed: %w", nativeErr, err)
+			}
+			// Native request already succeeded. Only native-request-triggered
+			// discovery can treat labels as best-effort; label-triggered
+			// projects must keep the handoff retryable until labels land.
+			if forgejoReviewerRequireReviewRequestForRepo(cfg, repo, cwd) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// forgejoReviewerRequireReviewRequestForRepo reports whether reviewer discovery
+// for the matched Forgejo project requires a native review request. Defaults to
+// true when no unique project match exists (labels are also empty in that case).
+func forgejoReviewerRequireReviewRequestForRepo(cfg *config.Config, repo, cwd string) bool {
+	if cfg == nil {
+		return true
+	}
+	repo = strings.TrimSpace(repo)
+	if strings.TrimSpace(cwd) != "" {
+		for _, project := range cfg.Projects {
+			if cwdBelongsToProject(project, cwd) {
+				return forgejoReviewerRequireReviewRequestForProject(*cfg, project)
+			}
+		}
+	}
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return true
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		return forgejoReviewerRequireReviewRequestForProject(*cfg, *matched)
+	}
+	return true
+}
+
+func forgejoReviewerRequireReviewRequestForProject(cfg config.Config, project config.ProjectRefConfig) bool {
+	if config.ResolvedProjectProviderKind(cfg, project) != config.ProviderKindForgejo {
+		return true
+	}
+	return config.ProjectRoleConfigs(cfg, project.ID).Reviewer.Discovery.Triggers.RequireReviewRequest
 }
 
 func forgejoClientForCWD(cfg *config.Config, cwd string) (*forge.ForgejoClient, bool, error) {
@@ -205,70 +522,94 @@ func forgejoProviderForRepo(cfg *config.Config, repo string) (config.ProviderCon
 		return config.ProviderConfig{}, false, nil
 	}
 	repo = strings.TrimSpace(repo)
+	var matched *config.ProjectRefConfig
 	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.Repo) != repo {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
 			continue
 		}
-		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+		if matched != nil {
+			return config.ProviderConfig{}, false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindForgejo {
 			return config.ProviderConfig{}, false, nil
 		}
-		provider, ok := forgejoProviderByID(*cfg, project.Provider)
+		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
 		if !ok {
-			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", project.Provider, repo)
+			return config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for repo %s", matched.Provider, repo)
 		}
 		return provider, true, nil
 	}
 	return config.ProviderConfig{}, false, nil
 }
 
-func forgejoReviewerDiscoveryLabelsForRepo(cfg *config.Config, repo string) []string {
-	if cfg == nil {
-		return nil
-	}
-	repo = strings.TrimSpace(repo)
-	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.Repo) != repo {
-			continue
-		}
-		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
-			return nil
-		}
-		labels := config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Discovery.Triggers.Labels
-		result := make([]string, 0, len(labels))
-		for _, label := range labels {
-			label = strings.TrimSpace(label)
-			if label == "" {
-				continue
-			}
-			result = append(result, label)
-		}
-		return result
-	}
-	return nil
-}
-
 func forgejoProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
 	if cfg == nil {
 		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
 	}
-	cwd = strings.TrimSpace(cwd)
-	for _, project := range cfg.Projects {
-		if strings.TrimSpace(project.RepoPath) != cwd {
-			continue
-		}
-		if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
-			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
-		}
-		provider, ok := forgejoProviderByID(*cfg, project.Provider)
-		if !ok {
-			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for project %s", project.Provider, project.ID)
-		}
-		if strings.TrimSpace(project.Repo) == "" {
-			return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo project %s is missing repo", project.ID)
-		}
-		return project, provider, true, nil
+	project, matched, err := projectForCWD(*cfg, cwd)
+	if err != nil || !matched {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
 	}
-	return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	provider, ok := forgejoProviderByID(*cfg, project.Provider)
+	if !ok {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo provider %q not configured for project %s", project.Provider, project.ID)
+	}
+	if strings.TrimSpace(project.Repo) == "" {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("forgejo project %s is missing repo", project.ID)
+	}
+	return project, provider, true, nil
+}
+
+func projectForCWD(cfg config.Config, cwd string) (config.ProjectRefConfig, bool, error) {
+	matches := make([]config.ProjectRefConfig, 0, 1)
+	for _, project := range cfg.Projects {
+		if cwdBelongsToProject(project, cwd) {
+			matches = append(matches, project)
+		}
+	}
+	if len(matches) == 0 {
+		return config.ProjectRefConfig{}, false, nil
+	}
+	if len(matches) > 1 {
+		ids := make([]string, 0, len(matches))
+		for _, project := range matches {
+			ids = append(ids, project.ID)
+		}
+		return config.ProjectRefConfig{}, false, fmt.Errorf("working directory %s matches multiple projects: %s", strings.TrimSpace(cwd), strings.Join(ids, ", "))
+	}
+	return matches[0], true, nil
+}
+
+func cwdBelongsToProject(project config.ProjectRefConfig, cwd string) bool {
+	cwd = filepath.Clean(strings.TrimSpace(cwd))
+	if cwd == "." || cwd == "" {
+		return false
+	}
+	repoPath := filepath.Clean(strings.TrimSpace(project.RepoPath))
+	if repoPath != "." && cwd == repoPath {
+		return true
+	}
+	worktreeRoot := ""
+	if project.WorktreeRoot != nil {
+		worktreeRoot = strings.TrimSpace(*project.WorktreeRoot)
+	}
+	if worktreeRoot == "" {
+		resolved, err := config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
+		if err != nil {
+			return false
+		}
+		worktreeRoot = resolved
+	}
+	worktreeRoot = filepath.Clean(worktreeRoot)
+	relative, err := filepath.Rel(worktreeRoot, cwd)
+	return err == nil && relative != "." && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func forgejoProviderByID(cfg config.Config, providerID string) (config.ProviderConfig, bool) {
@@ -282,6 +623,84 @@ func forgejoProviderByID(cfg config.Config, providerID string) (config.ProviderC
 		}
 	}
 	return config.ProviderConfig{}, false
+}
+
+// planeClientForRepo returns a Plane task-source client for a project whose
+// provider kind is "plane" and whose code repo (project.Repo, a GitHub repo)
+// matches repo. The second return is false when repo is not a plane project, in
+// which case callers fall through to the GitHub/forgejo path.
+func planeClientForRepo(cfg *config.Config, repo string) (*forge.PlaneClient, bool, error) {
+	provider, codeRepo, ok, err := planeProviderForRepo(cfg, repo)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	client, err := forge.NewPlaneClientFromConfig(provider, codeRepo)
+	if err != nil {
+		return nil, true, err
+	}
+	return client, true, nil
+}
+
+func planeClientForCWD(cfg *config.Config, cwd string) (*forge.PlaneClient, bool, error) {
+	project, provider, ok, err := planeProjectProviderForCWD(cfg, cwd)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
+	client, err := forge.NewPlaneClientFromConfig(provider, strings.TrimSpace(project.Repo))
+	if err != nil {
+		return nil, true, err
+	}
+	return client, true, nil
+}
+
+func planeProviderForRepo(cfg *config.Config, repo string) (config.ProviderConfig, string, bool, error) {
+	if cfg == nil {
+		return config.ProviderConfig{}, "", false, nil
+	}
+	repo = strings.TrimSpace(repo)
+	var matched *config.ProjectRefConfig
+	for _, project := range cfg.Projects {
+		if !strings.EqualFold(strings.TrimSpace(project.Repo), repo) {
+			continue
+		}
+		if matched != nil {
+			return config.ProviderConfig{}, "", false, fmt.Errorf("repository %s is bound to multiple projects; project path or id is required", repo)
+		}
+		projectCopy := project
+		matched = &projectCopy
+	}
+	if matched != nil {
+		if config.ResolvedProjectProviderKind(*cfg, *matched) != config.ProviderKindPlane {
+			return config.ProviderConfig{}, "", false, nil
+		}
+		provider, ok := forgejoProviderByID(*cfg, matched.Provider)
+		if !ok {
+			return config.ProviderConfig{}, "", false, fmt.Errorf("plane provider %q not configured for repo %s", matched.Provider, repo)
+		}
+		return provider, strings.TrimSpace(matched.Repo), true, nil
+	}
+	return config.ProviderConfig{}, "", false, nil
+}
+
+func planeProjectProviderForCWD(cfg *config.Config, cwd string) (config.ProjectRefConfig, config.ProviderConfig, bool, error) {
+	if cfg == nil {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	project, matched, err := projectForCWD(*cfg, cwd)
+	if err != nil || !matched {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, err
+	}
+	if config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindPlane {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, nil
+	}
+	provider, ok := forgejoProviderByID(*cfg, project.Provider)
+	if !ok {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane provider %q not configured for project %s", project.Provider, project.ID)
+	}
+	if strings.TrimSpace(project.Repo) == "" {
+		return config.ProjectRefConfig{}, config.ProviderConfig{}, false, fmt.Errorf("plane project %s is missing repo", project.ID)
+	}
+	return project, provider, true, nil
 }
 
 func forgeIdentityLogins(identities []forge.Identity) []string {
@@ -310,6 +729,115 @@ func forgeLabelNames(labels []forge.Label) []string {
 	return names
 }
 
+func forgeReviewContext(ctx context.Context, client *forge.ForgejoClient, pr forge.PullRequest, compatibilityFallback bool, includeComments bool) ([]string, []networkpolicy.GitHubUser, []map[string]any, string, error) {
+	requested := pr.Reviewers
+	var reviews []forge.PullRequestReview
+	var err error
+	if includeComments {
+		reviews, err = client.ListPullRequestReviews(ctx, pr.Number)
+	} else {
+		reviews, err = client.ListPullRequestReviewSummaries(ctx, pr.Number)
+	}
+	if err != nil {
+		var capabilityErr *forge.UnsupportedCapabilityError
+		if !compatibilityFallback || !errors.As(err, &capabilityErr) {
+			return nil, nil, nil, "", err
+		}
+	}
+	objects := make([]map[string]any, 0, len(reviews))
+	latestVotes := map[string]forge.PullRequestReview{}
+	for _, review := range reviews {
+		objects = append(objects, map[string]any{
+			"id":        review.ID,
+			"author":    map[string]any{"login": review.User.Login},
+			"body":      review.Body,
+			"state":     review.State,
+			"commit":    map[string]any{"oid": review.CommitID},
+			"url":       review.HTMLURL,
+			"comments":  forgeReviewCommentsToObjects(review.Comments),
+			"dismissed": review.Dismissed,
+			"stale":     review.Stale,
+		})
+		if login := strings.ToLower(strings.TrimSpace(review.User.Login)); login != "" && (review.State == "CHANGES_REQUESTED" || review.State == "APPROVED") && !review.Dismissed {
+			if prior, found := latestVotes[login]; !found || review.ID > prior.ID {
+				latestVotes[login] = review
+			}
+		}
+	}
+	decision := ""
+	for _, review := range latestVotes {
+		if review.State == "CHANGES_REQUESTED" {
+			decision = "CHANGES_REQUESTED"
+			break
+		}
+		if review.State == "APPROVED" {
+			decision = "APPROVED"
+		}
+	}
+	return forgeIdentityLogins(requested), forgeNetworkPolicyUsers(requested), objects, decision, nil
+}
+
+func forgeReviewCommentsToObjects(comments []forge.PullRequestReviewComment) []map[string]any {
+	objects := make([]map[string]any, 0, len(comments))
+	for _, comment := range comments {
+		objects = append(objects, map[string]any{
+			"id": comment.ID, "body": comment.Body, "author": map[string]any{"login": comment.User.Login},
+			"url": comment.HTMLURL, "path": comment.Path, "diffHunk": comment.DiffHunk,
+			"isResolved": comment.Resolver.Value != nil, "updatedAt": comment.UpdatedAt,
+		})
+	}
+	return objects
+}
+
+func forgeReviewContextComments(reviews []map[string]any) []map[string]any {
+	var comments []map[string]any
+	for _, review := range reviews {
+		state, _ := review["state"].(string)
+		if state == "PENDING" || state == "DISMISSED" {
+			continue
+		}
+		inline, _ := review["comments"].([]map[string]any)
+		comments = append(comments, inline...)
+	}
+	return comments
+}
+
+func forgeChecksToObjects(checks []forge.CommitCheck) []map[string]any {
+	objects := make([]map[string]any, 0, len(checks))
+	for _, check := range checks {
+		objects = append(objects, map[string]any{
+			"id": check.ID, "name": check.Name, "state": check.State,
+			"description": check.Description, "url": check.URL, "detailsUrl": check.URL,
+			"actionRunId": check.ActionRunID,
+		})
+	}
+	return objects
+}
+
+func forgejoSummaryCommentMode(cfg *config.Config, repo, cwd string) bool {
+	if cfg == nil {
+		return false
+	}
+	project, matched, err := projectForCWD(*cfg, cwd)
+	if err != nil {
+		return false
+	}
+	if !matched {
+		repo = strings.TrimSpace(repo)
+		for _, candidate := range cfg.Projects {
+			if strings.EqualFold(strings.TrimSpace(candidate.Repo), repo) {
+				project = candidate
+				matched = true
+				break
+			}
+		}
+	}
+	if !matched || config.ResolvedProjectProviderKind(*cfg, project) != config.ProviderKindForgejo {
+		return false
+	}
+	return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode == config.ReviewerPublishModeSummaryComment
+}
+
 func appendLabels(label string, labels []string) []string {
 	result := make([]string, 0, len(labels)+1)
 	if label = strings.TrimSpace(label); label != "" {
@@ -330,17 +858,93 @@ func forgeNetworkPolicyUsers(users []forge.Identity) []networkpolicy.GitHubUser 
 	return converted
 }
 
-func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForRepo(a.config, repo)
+func (a plannerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
+// plane returns a Plane task-source client when repo belongs to a plane-kind
+// project. Issue-side reads/mutations for such projects are served by Plane;
+// pull-request operations are left to the GitHub path (repo is the code repo).
+func (a plannerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
+	client, ok, err := forgeClientForLocation(a.config, repo, cwd, planeClientForCWD, planeClientForRepo)
+	return client, ok, err
+}
+
+func forgeClientForLocation[T any](cfg *config.Config, repo string, cwd []string, byCWD func(*config.Config, string) (*T, bool, error), byRepo func(*config.Config, string) (*T, bool, error)) (*T, bool, error) {
+	if len(cwd) > 0 && strings.TrimSpace(cwd[0]) != "" {
+		client, ok, err := byCWD(cfg, cwd[0])
+		if ok || err != nil {
+			return client, ok, err
+		}
+		// A configured project path is authoritative even when it belongs to
+		// GitHub; do not fall through and select a same-slug Forgejo project.
+		if cfg != nil {
+			for _, project := range cfg.Projects {
+				if cwdBelongsToProject(project, cwd[0]) {
+					return nil, false, nil
+				}
+			}
+		}
+	}
+	return byRepo(cfg, repo)
+}
+
+// forgejoClientForIssueLookup binds ViewIssue to the referenced repository.
+// CWD still disambiguates same-slug projects, but a closing reference such as
+// Fixes other/repo#123 must not reuse the PR project's client.
+func forgejoClientForIssueLookup(cfg *config.Config, repo, cwd string) (*forge.ForgejoClient, bool, error) {
+	repo = strings.TrimSpace(repo)
+	cwd = strings.TrimSpace(cwd)
+	if cwd != "" {
+		project, provider, ok, err := forgejoProjectProviderForCWD(cfg, cwd)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			projectRepo := strings.TrimSpace(project.Repo)
+			if repo == "" || strings.EqualFold(projectRepo, repo) {
+				client, err := forge.NewForgejoClientFromConfig(provider, projectRepo)
+				if err != nil {
+					return nil, true, err
+				}
+				return client, true, nil
+			}
+			client, ok, err := forgejoClientForRepo(cfg, repo)
+			if ok || err != nil {
+				return client, ok, err
+			}
+			return nil, true, &forge.ForgejoHTTPError{
+				Method:     http.MethodGet,
+				Path:       "issues",
+				StatusCode: http.StatusNotFound,
+				Message:    fmt.Sprintf("cross-repository issue %s is not bound to a configured Forgejo project", repo),
+			}
+		}
+	}
+	return forgeClientForLocation(cfg, repo, []string{cwd}, forgejoClientForCWD, forgejoClientForRepo)
+}
+
 func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.ListOpenIssuesInput) ([]planner.IssueSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
 		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]planner.IssueSummary, 0, len(issues))
+		for _, issue := range issues {
+			result = append(result, planner.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+		}
+		return result, nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		issues, err := forgejoDiscoveryIssues(ctx, client, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, input.IssueNumber)
 		if err != nil {
 			return nil, err
 		}
@@ -365,7 +969,17 @@ func (a plannerGitHubAdapter) ListOpenIssues(ctx context.Context, input planner.
 }
 
 func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewIssueInput) (planner.IssueDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return planner.IssueDetail{}, err
+		}
+		issue, err := client.ViewIssue(ctx, input.IssueNumber)
+		if err != nil {
+			return planner.IssueDetail{}, err
+		}
+		return planner.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return planner.IssueDetail{}, err
 		}
@@ -386,7 +1000,14 @@ func (a plannerGitHubAdapter) ViewIssue(ctx context.Context, input planner.ViewI
 }
 
 func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := planeClientForCWD(a.config, cwd); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		identity, err := client.CurrentUser(ctx)
+		return identity.Login, err
+	}
+	if client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -400,7 +1021,13 @@ func (a plannerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd strin
 }
 
 func (a plannerGitHubAdapter) AddIssueAssignees(ctx context.Context, input planner.IssueAssigneesInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -424,7 +1051,7 @@ func networkPolicyUsers(users []githubinfra.GitHubUser) []networkpolicy.GitHubUs
 }
 
 func (a plannerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input planner.ListOpenPullRequestsInput) ([]planner.PullRequestSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -453,7 +1080,7 @@ func (a plannerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input pl
 }
 
 func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner.ViewPullRequestInput) (planner.PullRequestDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return planner.PullRequestDetail{}, err
 		}
@@ -461,7 +1088,7 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 		if err != nil {
 			return planner.PullRequestDetail{}, err
 		}
-		return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name}, nil
+		return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, Labels: forgeLabelNames(pr.Labels), HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name}, nil
 	}
 	if a.gateway == nil {
 		return planner.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -470,12 +1097,12 @@ func (a plannerGitHubAdapter) ViewPullRequest(ctx context.Context, input planner
 	if err != nil {
 		return planner.PullRequestDetail{}, err
 	}
-	return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.URL, State: pr.State, HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
+	return planner.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.URL, State: pr.State, Labels: append([]string(nil), pr.Labels...), HeadRefName: pr.HeadRefName, BaseRefName: pr.BaseRefName}, nil
 }
 
 func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input planner.CreatePullRequestInput) (planner.CreatePullRequestResult, error) {
-	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return planner.CreatePullRequestResult{}, err
 		}
@@ -496,8 +1123,8 @@ func (a plannerGitHubAdapter) CreatePullRequest(ctx context.Context, input plann
 }
 
 func (a plannerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input planner.UpdatePullRequestBodyInput) error {
-	body := a.stamper.Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "planner", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -511,7 +1138,7 @@ func (a plannerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input p
 }
 
 func (a plannerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input planner.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -525,11 +1152,11 @@ func (a plannerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input pl
 }
 
 func (a plannerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input planner.PullRequestReviewersInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
-		return nil
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
@@ -559,7 +1186,7 @@ func (a plannerGitAdapter) InspectHead(ctx context.Context, input planner.Inspec
 }
 
 func (a plannerGitAdapter) Commit(ctx context.Context, input planner.CommitInput) (planner.CommitResult, error) {
-	message := a.stamper.CommitMessage(input.Message, "planner")
+	message := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).CommitMessage(input.Message, "planner")
 	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return planner.CommitResult{}, err
@@ -575,7 +1202,12 @@ type plannerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type plannerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a plannerAgentExecutorAdapter) Start(ctx context.Context, input planner.AgentRunInput) (planner.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	execution, err := a.executor.Start(ctx, agent.RunInput{
+		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
+		Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -596,13 +1228,13 @@ type reviewerGitHubAdapter struct {
 	config  *config.Config
 }
 
-func (a reviewerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForRepo(a.config, repo)
+func (a reviewerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
 func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input reviewer.ListOpenPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -616,7 +1248,14 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 		}
 		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
 		for _, pr := range pullRequests {
-			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login})
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD), false)
+			if err != nil {
+				return nil, err
+			}
+			// Exact merge-tree checks stay on ViewPullRequest. List runs before
+			// eligibility filtering, and one mergeable=false draft whose commits
+			// cannot be fetched or merge-tree'd must not abort the whole list.
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
 		}
 		return result, nil
 	}
@@ -635,11 +1274,26 @@ func (a reviewerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input r
 }
 
 func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Context, input reviewer.ListReviewRequestedPullRequestsInput) ([]reviewer.PullRequestSummary, error) {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("forgejo reviewer does not support review-request discovery")
+		pullRequests, err := client.ListReviewRequestedPullRequests(ctx, input.Reviewer, input.Limit)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]reviewer.PullRequestSummary, 0, len(pullRequests))
+		for _, pr := range pullRequests {
+			requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD), false)
+			if err != nil {
+				return nil, err
+			}
+			// Exact merge-tree checks stay on ViewPullRequest. List runs before
+			// eligibility filtering, and one mergeable=false draft whose commits
+			// cannot be fetched or merge-tree'd must not abort the whole list.
+			result = append(result, reviewer.PullRequestSummary{Number: pr.Number, Title: pr.Title, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, Reviews: reviews})
+		}
+		return result, nil
 	}
 	if a.gateway == nil {
 		return nil, fmt.Errorf("github gateway is not configured")
@@ -656,7 +1310,7 @@ func (a reviewerGitHubAdapter) ListReviewRequestedPullRequests(ctx context.Conte
 }
 
 func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -666,11 +1320,23 @@ func (a reviewerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd stri
 	if a.gateway == nil {
 		return "", fmt.Errorf("github gateway is not configured")
 	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+	login, err := a.gateway.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", err
+	}
+	login = strings.TrimSpace(login)
+	if login != "" {
+		return login, nil
+	}
+	ident, identErr := a.gateway.GetCurrentUserIdentity(ctx, cwd)
+	if identErr != nil {
+		return "", identErr
+	}
+	return strings.TrimSpace(ident.Login), nil
 }
 
 func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input reviewer.ViewPullRequestInput) (reviewer.PullRequestDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
@@ -678,19 +1344,30 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		diff, err := client.PullRequestDiff(ctx, input.PRNumber)
-		if err != nil {
-			return reviewer.PullRequestDetail{}, err
-		}
 		comments, err := client.ListIssueComments(ctx, input.PRNumber)
 		if err != nil {
 			return reviewer.PullRequestDetail{}, err
 		}
-		return reviewer.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, Diff: diff, IssueComments: forgeCommentsToObjects(comments)}, nil
+		requests, requestUsers, reviews, decision, err := forgeReviewContext(ctx, client, pr, forgejoSummaryCommentMode(a.config, input.Repo, input.CWD), true)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		checks, err := client.ListCommitChecks(ctx, pr.Head.SHA)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
+		if err != nil {
+			return reviewer.PullRequestDetail{}, err
+		}
+		return reviewer.PullRequestDetail{Number: pr.Number, URL: pr.HTMLURL, Title: pr.Title, Body: pr.Body, State: pr.State, IsDraft: pr.IsDraft, ReviewDecision: decision, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, BaseSHA: pr.Base.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, Author: pr.User.Login, ReviewRequests: requests, ReviewRequestUsers: requestUsers, HasConflicts: conflicted, ChecksSummary: summarizeCheckStates(forgeChecksToObjects(checks)), Comments: forgeReviewContextComments(reviews), IssueComments: forgeCommentsToObjects(comments), Reviews: reviews}, nil
 	}
 	if a.gateway == nil {
 		return reviewer.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
 	}
+	// Always use the reviewer profile (includes reviews). Do not route through
+	// DiscoverySnapshot/ViewPullRequest, which intentionally uses the fixer
+	// profile and omits reviews for shared discovery caching.
 	detail, err := a.gateway.ViewPullRequestForReviewer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
 		return reviewer.PullRequestDetail{}, err
@@ -698,20 +1375,58 @@ func (a reviewerGitHubAdapter) ViewPullRequest(ctx context.Context, input review
 	return reviewer.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, State: detail.State, IsDraft: detail.IsDraft, ReviewDecision: detail.ReviewDecision, Labels: detail.Labels, HeadSHA: detail.HeadSHA, BaseSHA: detail.BaseSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, Author: detail.Author, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers), HasConflicts: detail.HasConflicts, ChecksSummary: summarizeCheckStates(detail.Checks), Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Reviews: detail.Reviews}, nil
 }
 
+// LoadPullRequestReviews implements reviewer engagement recovery. It always uses
+// the reviewer profile so DiscoverySnapshot's fixer-profile cache cannot strip
+// the submitted reviews needed to restore lastPublishedHeadSha.
+func (a reviewerGitHubAdapter) LoadPullRequestReviews(ctx context.Context, input reviewer.ViewPullRequestInput) ([]map[string]any, error) {
+	detail, err := a.ViewPullRequest(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return detail.Reviews, nil
+}
+
 func (a reviewerGitHubAdapter) ViewIssue(ctx context.Context, input githubinfra.ViewIssueInput) (githubinfra.IssueDetail, error) {
+	if client, ok, err := forgejoClientForIssueContext(ctx, a.config, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return githubinfra.IssueDetail{}, err
+		}
+		issue, err := client.ViewIssue(ctx, input.IssueNumber)
+		if err != nil {
+			return githubinfra.IssueDetail{}, err
+		}
+		return githubinfra.IssueDetail{IsPullRequest: issue.IsPullRequest, Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, Labels: forgeLabelNames(issue.Labels), Assignees: forgeIdentityLogins(issue.Assignees), Author: issue.User.Login}, nil
+	}
+	if a.gateway == nil {
+		return githubinfra.IssueDetail{}, fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.ViewIssue(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) GetRepositorySettings(ctx context.Context, input githubinfra.RepositorySettingsInput) (githubinfra.RepositorySettings, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return githubinfra.RepositorySettings{}, err
+		}
+		settings, err := client.GetRepositoryMergeSettings(ctx)
+		return githubinfra.RepositorySettings{AllowSquashMerge: settings.AllowSquashMerge, AllowMergeCommit: settings.AllowMergeCommit, AllowRebaseMerge: settings.AllowRebaseMerge, AllowAutoMerge: true}, err
+	}
 	return a.gateway.GetRepositorySettings(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) GetBranchProtection(ctx context.Context, input githubinfra.BranchProtectionInput) (githubinfra.BranchProtection, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return githubinfra.BranchProtection{}, err
+		}
+		branch, err := client.GetBranchProtection(ctx, input.Branch)
+		return githubinfra.BranchProtection{Enabled: branch.Protected, HasRequiredChecks: branch.Protected && branch.EnableStatusCheck && len(branch.StatusCheckContexts) > 0, RequiredChecks: branch.StatusCheckContexts}, err
+	}
 	return a.gateway.GetBranchProtection(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input reviewer.ViewPullRequestInput) (string, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -725,7 +1440,7 @@ func (a reviewerGitHubAdapter) GetPullRequestHeadSHA(ctx context.Context, input 
 }
 
 func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, input reviewer.CapturePullRequestSnapshotInput) (storage.PullRequestSnapshotRecord, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
@@ -733,26 +1448,22 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 		if err != nil {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
-		diff, err := client.PullRequestDiff(ctx, input.PRNumber)
-		if err != nil {
-			return storage.PullRequestSnapshotRecord{}, err
-		}
-		payloadJSON, err := json.Marshal(map[string]any{"diff": diff})
+		payload, err := json.Marshal(map[string]any{"detail": map[string]any{"state": pr.State, "isDraft": pr.IsDraft}})
 		if err != nil {
 			return storage.PullRequestSnapshotRecord{}, err
 		}
 		baseSHA := strings.TrimSpace(pr.Base.SHA)
 		return storage.PullRequestSnapshotRecord{
-			ID:          fmt.Sprintf("snapshot:%d:%s", input.PRNumber, input.CapturedAt),
+			ID:          fmt.Sprintf("snapshot:%s:%d:%s", input.ProjectID, input.PRNumber, input.CapturedAt),
 			ProjectID:   input.ProjectID,
 			Repo:        input.Repo,
 			PRNumber:    input.PRNumber,
+			PayloadJSON: stringPtr(string(payload)),
 			HeadSHA:     pr.Head.SHA,
 			BaseSHA:     stringPtr(baseSHA),
 			Title:       stringPtr(pr.Title),
 			Body:        stringPtr(pr.Body),
 			Author:      stringPtr(pr.User.Login),
-			PayloadJSON: stringPtr(string(payloadJSON)),
 			CapturedAt:  input.CapturedAt,
 			CreatedAt:   input.CapturedAt,
 		}, nil
@@ -764,6 +1475,26 @@ func (a reviewerGitHubAdapter) CapturePullRequestSnapshot(ctx context.Context, i
 }
 
 func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input reviewer.VerifyReviewMarkerInput) (reviewer.ReviewMarkerResult, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return reviewer.ReviewMarkerResult{}, err
+		}
+		if forgejoSummaryCommentMode(a.config, input.Repo, input.CWD) {
+			comments, err := client.ListIssueComments(ctx, input.PRNumber)
+			if err != nil {
+				return reviewer.ReviewMarkerResult{}, err
+			}
+			return findForgejoReviewMarker(comments, input), nil
+		}
+		reviews, err := client.ListPullRequestReviews(ctx, input.PRNumber)
+		if err != nil {
+			return reviewer.ReviewMarkerResult{}, err
+		}
+		return findForgejoNativeReviewMarker(reviews, input), nil
+	}
+	if a.gateway == nil {
+		return reviewer.ReviewMarkerResult{}, fmt.Errorf("github gateway is not configured")
+	}
 	allowedReviewEvents := make([]string, 0, len(input.AllowedReviewEvents))
 	for _, event := range input.AllowedReviewEvents {
 		allowedReviewEvents = append(allowedReviewEvents, string(event))
@@ -775,9 +1506,218 @@ func (a reviewerGitHubAdapter) FindReviewMarker(ctx context.Context, input revie
 	return reviewer.ReviewMarkerResult{Found: marker.Found, Outcome: marker.Outcome, Event: reviewer.ReviewEvent(marker.Event), AuthorLogin: marker.AuthorLogin, Body: marker.Body, InlineCommentBodies: append([]string(nil), marker.InlineCommentBodies...)}, nil
 }
 
+var runtimeReviewMarkerRE = regexp.MustCompile(`<!--\s*looper:review\s+([^>]*)-->`)
+
+func findForgejoReviewMarker(comments []forge.Comment, input reviewer.VerifyReviewMarkerInput) reviewer.ReviewMarkerResult {
+	expectedAuthor := strings.ToLower(strings.TrimSpace(input.AuthorLogin))
+	var newest reviewer.ReviewMarkerResult
+	for _, comment := range comments {
+		body := strings.TrimSpace(comment.Body)
+		if body == "" {
+			continue
+		}
+		parsedMarker, ok := findRuntimeReviewIdempotencyMarker(body, input.Marker)
+		if !ok {
+			continue
+		}
+		author := strings.TrimSpace(comment.User.Login)
+		if expectedAuthor != "" && strings.ToLower(author) != expectedAuthor {
+			continue
+		}
+		if !forgejoReviewMarkerAllowed(parsedMarker.Outcome, input.AllowedReviewEvents, input.AllowCleanComment) {
+			continue
+		}
+		newest = reviewer.ReviewMarkerResult{Found: true, Outcome: parsedMarker.Outcome, Event: reviewer.ReviewEventComment, AuthorLogin: author, Body: comment.Body}
+	}
+	return newest
+}
+
+func findForgejoNativeReviewMarker(reviews []forge.PullRequestReview, input reviewer.VerifyReviewMarkerInput) reviewer.ReviewMarkerResult {
+	expectedAuthor := strings.ToLower(strings.TrimSpace(input.AuthorLogin))
+	var newest reviewer.ReviewMarkerResult
+	for _, review := range reviews {
+		marker, ok := findRuntimeReviewIdempotencyMarker(review.Body, input.Marker)
+		if !ok {
+			continue
+		}
+		if review.CommitID != "" && !strings.EqualFold(strings.TrimSpace(review.CommitID), marker.Head) {
+			continue
+		}
+		author := strings.TrimSpace(review.User.Login)
+		if expectedAuthor != "" && strings.ToLower(author) != expectedAuthor {
+			continue
+		}
+		event := forgejoReviewEventFromState(review.State)
+		if !forgejoNativeReviewMarkerEventAllowed(marker.Outcome, event, input.AllowedReviewEvents, input.AllowCleanComment, input.AllowBlockingComment) {
+			continue
+		}
+		inlineBodies := make([]string, 0, len(review.Comments))
+		for _, comment := range review.Comments {
+			inlineBodies = append(inlineBodies, comment.Body)
+		}
+		newest = reviewer.ReviewMarkerResult{Found: true, Outcome: marker.Outcome, Event: event, AuthorLogin: author, Body: review.Body, InlineCommentBodies: inlineBodies}
+	}
+	return newest
+}
+
+// forgejoReviewEventFromState maps Forgejo review states onto Looper review events.
+// States are expected after forge.normalizeForgejoReviewState (APPROVED/COMMENTED/CHANGES_REQUESTED).
+func forgejoReviewEventFromState(state string) reviewer.ReviewEvent {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "APPROVED":
+		return reviewer.ReviewEventApprove
+	case "CHANGES_REQUESTED", "REQUEST_CHANGES":
+		return reviewer.ReviewEventRequestChanges
+	case "COMMENTED", "COMMENT":
+		return reviewer.ReviewEventComment
+	default:
+		return ""
+	}
+}
+
+// forgejoNativeReviewMarkerEventAllowed mirrors github.reviewMarkerEventAllowedForOutcome so
+// outcome=clean requires APPROVE when that event is allowed, outcome=blocking requires
+// REQUEST_CHANGES when allowed, and COMMENT only matches non-blocking/actionable (or the
+// explicit self-authored COMMENT transport fallbacks).
+func forgejoNativeReviewMarkerEventAllowed(outcome string, event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent, allowCleanComment, allowBlockingComment bool) bool {
+	if event == "" {
+		return false
+	}
+	if len(allowed) == 0 {
+		return true
+	}
+	if !forgejoReviewEventAllowed(event, allowed) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean":
+		if allowCleanComment && event == reviewer.ReviewEventComment {
+			return true
+		}
+		if forgejoReviewEventAllowed(reviewer.ReviewEventApprove, allowed) {
+			return event == reviewer.ReviewEventApprove
+		}
+		return event == reviewer.ReviewEventComment
+	case "blocking":
+		if allowBlockingComment && event == reviewer.ReviewEventComment {
+			return true
+		}
+		if forgejoReviewEventAllowed(reviewer.ReviewEventRequestChanges, allowed) {
+			return event == reviewer.ReviewEventRequestChanges
+		}
+		return event == reviewer.ReviewEventComment
+	case "non_blocking", "actionable":
+		return event == reviewer.ReviewEventComment
+	default:
+		return false
+	}
+}
+
+func forgejoReviewEventAllowed(event reviewer.ReviewEvent, allowed []reviewer.ReviewEvent) bool {
+	for _, candidate := range allowed {
+		if candidate == event {
+			return true
+		}
+	}
+	return false
+}
+
+type runtimeReviewIdempotencyMarker struct {
+	ID      string
+	Head    string
+	Outcome string
+}
+
+func findRuntimeReviewIdempotencyMarker(body string, marker string) (runtimeReviewIdempotencyMarker, bool) {
+	marker = strings.TrimSpace(marker)
+	for _, parsedMarker := range parseRuntimeReviewIdempotencyMarkers(body) {
+		if marker == "" || parsedMarker.matches(marker) {
+			return parsedMarker, true
+		}
+	}
+	return runtimeReviewIdempotencyMarker{}, false
+}
+
+func parseRuntimeReviewIdempotencyMarkers(body string) []runtimeReviewIdempotencyMarker {
+	matches := runtimeReviewMarkerRE.FindAllStringSubmatch(body, -1)
+	markers := make([]runtimeReviewIdempotencyMarker, 0, len(matches))
+	for _, match := range matches {
+		if len(match) != 2 {
+			continue
+		}
+		fields := parseRuntimeReviewMarkerFields(match[1])
+		parsedMarker := runtimeReviewIdempotencyMarker{ID: fields["id"], Head: fields["head"], Outcome: fields["outcome"]}
+		if parsedMarker.ID == "" || parsedMarker.Head == "" || !runtimeValidReviewMarkerOutcome(parsedMarker.Outcome) {
+			continue
+		}
+		markers = append(markers, parsedMarker)
+	}
+	return markers
+}
+
+func parseRuntimeReviewMarkerFields(segment string) map[string]string {
+	fields := map[string]string{}
+	for _, field := range strings.Fields(segment) {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		fields[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+	}
+	return fields
+}
+
+func (m runtimeReviewIdempotencyMarker) matches(marker string) bool {
+	fields := parseRuntimeReviewMarkerFields(strings.TrimPrefix(marker, "looper:review"))
+	if id := fields["id"]; id != "" && id != m.ID {
+		return false
+	}
+	if idPrefix := fields["id_prefix"]; idPrefix != "" && !strings.HasPrefix(m.ID, idPrefix) {
+		return false
+	}
+	if head := fields["head"]; head != "" && head != m.Head {
+		return false
+	}
+	if outcome := fields["outcome"]; outcome != "" && outcome != m.Outcome {
+		return false
+	}
+	return strings.HasPrefix(marker, "looper:review") || strings.Contains(marker, "id=") || strings.Contains(marker, "head=") || strings.Contains(marker, "outcome=")
+}
+
+func runtimeValidReviewMarkerOutcome(outcome string) bool {
+	switch outcome {
+	case "clean", "non_blocking", "blocking", "actionable":
+		return true
+	default:
+		return false
+	}
+}
+
+func forgejoReviewMarkerAllowed(outcome string, allowed []reviewer.ReviewEvent, allowCleanComment bool) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case "clean":
+		if allowCleanComment {
+			return true
+		}
+		for _, event := range allowed {
+			if event == reviewer.ReviewEventComment {
+				return true
+			}
+		}
+		return false
+	case "blocking", "non_blocking", "actionable":
+		return true
+	default:
+		return false
+	}
+}
+
 func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input reviewer.IssueCommentInput) (reviewer.IssueCommentResult, error) {
-	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return reviewer.IssueCommentResult{}, err
 		}
@@ -798,7 +1738,7 @@ func (a reviewerGitHubAdapter) CreateIssueComment(ctx context.Context, input rev
 }
 
 func (a reviewerGitHubAdapter) ListIssueComments(ctx context.Context, input reviewer.ViewPullRequestInput) ([]reviewer.IssueComment, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -827,8 +1767,8 @@ func (a reviewerGitHubAdapter) ListIssueComments(ctx context.Context, input revi
 }
 
 func (a reviewerGitHubAdapter) UpdateIssueComment(ctx context.Context, input reviewer.UpdateIssueCommentInput) error {
-	body := a.stamper.Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "reviewer", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -842,27 +1782,78 @@ func (a reviewerGitHubAdapter) UpdateIssueComment(ctx context.Context, input rev
 }
 
 func (a reviewerGitHubAdapter) SubmitReview(ctx context.Context, input githubinfra.SubmitReviewInput) error {
+	stamper := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		comments := make([]forge.PullRequestReviewCommentInput, 0, len(input.Comments))
+		for _, comment := range input.Comments {
+			comments = append(comments, forge.PullRequestReviewCommentInput{Body: stamper.ReviewComment(comment.Body, "reviewer"), Path: comment.Path, Line: comment.Line, Side: comment.Side, StartLine: comment.StartLine, StartSide: comment.StartSide})
+		}
+		body := stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
+		_, err = client.CreatePullRequestReview(ctx, forge.CreatePullRequestReviewInput{Number: input.PRNumber, Body: body, Event: input.Event, CommitID: input.CommitID, Comments: comments})
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	// Stamp with run snapshot identity before GitHub submit (Forgejo path stamps above).
+	input.Body = stamper.Markdown(input.Body, "reviewer", disclosure.ChannelReviewComment)
+	if len(input.Comments) > 0 {
+		comments := make([]githubinfra.ReviewComment, len(input.Comments))
+		copy(comments, input.Comments)
+		for i := range comments {
+			comments[i].Body = stamper.ReviewComment(comments[i].Body, "reviewer")
+		}
+		input.Comments = comments
+	}
 	return a.gateway.SubmitReview(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) EnableAutoMerge(ctx context.Context, input githubinfra.EnableAutoMergeInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.EnableAutoMerge(ctx, input.PRNumber, string(input.Strategy), input.HeadSHA)
+	}
 	return a.gateway.EnableAutoMerge(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.AddIssueReaction(ctx, input.PRNumber, input.Content)
+	}
 	return a.gateway.AddPullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) RemovePullRequestReaction(ctx context.Context, input reviewer.PullRequestReactionInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.RemoveIssueReaction(ctx, input.PRNumber, input.Content)
+	}
 	return a.gateway.RemovePullRequestReaction(ctx, githubinfra.PullRequestReactionInput{Repo: input.Repo, PRNumber: input.PRNumber, Content: input.Content, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input reviewer.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err = client.AddIssueLabels(ctx, input.PRNumber, input.Labels)
+		return err
+	}
 	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input reviewer.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -880,11 +1871,31 @@ func (a reviewerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, inpu
 }
 
 func (a reviewerGitHubAdapter) RemoveIssueLabels(ctx context.Context, input githubinfra.IssueLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		for _, label := range input.Labels {
+			if err := client.RemoveIssueLabel(ctx, input.IssueNumber, label); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	return a.gateway.RemoveIssueLabels(ctx, input)
 }
 
 func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input reviewer.ListReviewThreadsInput) ([]reviewer.ReviewThread, error) {
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return []reviewer.ReviewThread{}, nil
+	}
+	if a.gateway == nil {
+		return nil, fmt.Errorf("github gateway is not configured")
+	}
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit, AllPages: input.AllPages})
 	if err != nil {
 		return nil, err
 	}
@@ -892,7 +1903,7 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 	for _, thread := range threads {
 		converted := reviewer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Path: thread.Path, Line: thread.Line, URL: thread.URL}
 		for _, comment := range thread.Comments {
-			converted.Comments = append(converted.Comments, reviewer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, Path: comment.Path, Line: comment.Line, OriginalCommitOID: comment.OriginalCommitOID, CommitOID: comment.CommitOID, URL: comment.URL})
+			converted.Comments = append(converted.Comments, reviewer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt, Path: comment.Path, Line: comment.Line, OriginalCommitOID: comment.OriginalCommitOID, CommitOID: comment.CommitOID, URL: comment.URL})
 		}
 		out = append(out, converted)
 	}
@@ -900,18 +1911,75 @@ func (a reviewerGitHubAdapter) ListReviewThreads(ctx context.Context, input revi
 }
 
 func (a reviewerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input reviewer.AddReviewThreadReplyInput) error {
-	body := a.stamper.ReviewComment(input.Body, "reviewer")
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).ReviewComment(input.Body, "reviewer")
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
 func (a reviewerGitHubAdapter) ResolveReviewThread(ctx context.Context, input reviewer.ResolveReviewThreadInput) error {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
-type reviewerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
-type reviewerAgentExecutionAdapter struct{ execution agent.Execution }
+type reviewerAgentExecutorAdapter struct {
+	executor   *agent.ConfiguredExecutor
+	realLooper string
+	trustedEnv map[string]string
+	// config is used to gate trusted review-submit sockets on per-project
+	// publish mode (summary_comment must not mint a native review socket).
+	config *config.Config
+	// agentVendor/agentModel are the role-resolved reviewer identity captured
+	// when handlers are built. Trusted review proxy config materializes the
+	// run snapshot when present, otherwise these values, so review_submit's
+	// disclosure.FromConfig stamps agent=/model= from execution identity
+	// rather than the daemon's global agent.vendor.
+	agentVendor config.AgentVendor
+	agentModel  *string
+	// tracker registers Supervisor-owned review-submit children for shutdown
+	// drain / retain-storage (#577).
+	tracker processcontainment.LiveTracker
+}
+type reviewerAgentExecutionAdapter struct {
+	execution agent.Execution
+	cleanup   func()
+	once      sync.Once
+}
 
-type reviewerGitAdapter struct{ gateway *gitinfra.Gateway }
+func (a *reviewerAgentExecutionAdapter) closeProxy() {
+	if a == nil {
+		return
+	}
+	a.once.Do(func() {
+		if a.cleanup != nil {
+			a.cleanup()
+		}
+	})
+}
+
+type reviewerGitAdapter struct {
+	gateway   *gitinfra.Gateway
+	localDiff *githubinfra.Gateway
+}
+
+func (a reviewerGitAdapter) ReadPullRequestDiff(ctx context.Context, cwd, baseSHA, headSHA string) (string, error) {
+	var diff string
+	err := a.localDiff.ReadLocalPullRequestDiff(ctx, cwd, baseSHA, headSHA, nil, func(reader io.Reader) error {
+		data, err := io.ReadAll(reader)
+		diff = string(data)
+		return err
+	})
+	return diff, err
+}
 
 func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.CreateWorktreeInput) (reviewer.CreateWorktreeResult, error) {
 	worktree, err := a.gateway.CreateWorktree(ctx, gitinfra.CreateWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, Branch: input.Branch, BaseBranch: input.BaseBranch, PRNumber: input.PRNumber, ProtectedBranches: input.ProtectedBranches, CheckoutMode: gitinfra.CheckoutMode(input.CheckoutMode)})
@@ -922,7 +1990,7 @@ func (a reviewerGitAdapter) CreateWorktree(ctx context.Context, input reviewer.C
 }
 
 func (a reviewerGitAdapter) PrepareWorktree(ctx context.Context, input reviewer.PrepareWorktreeInput) (reviewer.PrepareWorktreeResult, error) {
-	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, Remote: input.Remote})
+	result, err := a.gateway.PrepareWorktree(ctx, gitinfra.PrepareWorktreeInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, Ref: input.Ref, ExpectedHeadSHA: input.ExpectedHeadSHA, BaseSHA: input.BaseSHA, Remote: input.Remote})
 	if err != nil {
 		return reviewer.PrepareWorktreeResult{}, err
 	}
@@ -933,15 +2001,218 @@ func (a reviewerGitAdapter) CleanupWorktree(ctx context.Context, input reviewer.
 	return a.gateway.CleanupWorktree(ctx, gitinfra.CleanupWorktreeInput{ProjectID: input.ProjectID, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Branch: input.Branch, ProtectedBranches: input.ProtectedBranches})
 }
 
-func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
-	if err != nil {
-		return nil, err
-	}
-	return reviewerAgentExecutionAdapter{execution: execution}, nil
+func (a reviewerGitAdapter) ScrubReservedReviewerScratch(ctx context.Context, worktreePath string) error {
+	return a.gateway.ScrubReservedReviewerScratch(ctx, worktreePath)
 }
 
-func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.AgentResult, error) {
+// reviewerTrustedReviewEnv injects the trusted review-submit socket only for
+// reviewer agent runs. Planner/worker/fixer share the executor but must not
+// receive review publication capability via LOOPER_TRUSTED_REVIEW_SOCK.
+func reviewerTrustedReviewEnv(sock string) map[string]string {
+	sock = strings.TrimSpace(sock)
+	if sock == "" {
+		return nil
+	}
+	return map[string]string{forge.TrustedReviewSockEnv: sock}
+}
+
+// reviewerAllowsTrustedReviewProxy reports whether this reviewer agent start is
+// authorized to receive a live review-submit socket. Thread-resolution
+// classifiers share the reviewer adapter but must not receive publish capability.
+// Every native review/publish run needs the socket so its review-submit child
+// uses the immutable run config. Summary-comment mode must not mint a socket
+// because Looper posts that top-level comment outside agent review submit.
+func reviewerAllowsTrustedReviewProxy(cfg *config.Config, projectID string, metadata map[string]any) bool {
+	if metadata == nil {
+		return false
+	}
+	phase, _ := metadata["phase"].(string)
+	switch strings.ToLower(strings.TrimSpace(phase)) {
+	case "review", "publish":
+		// continue
+	default:
+		return false
+	}
+	return reviewerProjectNeedsTrustedProxy(cfg, projectID)
+}
+
+// reviewerProjectNeedsTrustedProxy reports whether the selected project
+// publishes native reviews (not summary_comment). This includes GitHub, Plane's
+// GitHub code side, and native Forgejo projects.
+func reviewerProjectNeedsTrustedProxy(cfg *config.Config, projectID string) bool {
+	if cfg == nil {
+		return false
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return false
+	}
+	for _, project := range cfg.Projects {
+		if strings.TrimSpace(project.ID) != projectID {
+			continue
+		}
+		return config.ProjectRoleConfigs(*cfg, project.ID).Reviewer.Behavior.PublishMode != config.ReviewerPublishModeSummaryComment
+	}
+	return false
+}
+
+// reviewerAllowedPRRef extracts the daemon-selected owner/repo#N from reviewer
+// agent metadata so the trusted review proxy can be bound to that PR only.
+func reviewerAllowedPRRef(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	repo, _ := metadata["repo"].(string)
+	repo = strings.TrimSpace(repo)
+	if repo == "" {
+		return ""
+	}
+	prNumber, ok := metadataInt64(metadata["prNumber"])
+	if !ok || prNumber <= 0 {
+		return ""
+	}
+	return forge.FormatTrustedReviewPRRef(repo, prNumber)
+}
+
+// reviewerAllowedReviewPolicy extracts daemon-selected review policy, head,
+// and run identity from reviewer metadata. The runner authors these fields from
+// its immutable loop/run checkpoint; agent argv is never authoritative.
+func reviewerAllowedReviewPolicy(metadata map[string]any) forge.TrustedReviewProxyPolicy {
+	if metadata == nil {
+		return forge.TrustedReviewProxyPolicy{}
+	}
+	clean, _ := metadata["cleanReviewEvent"].(string)
+	blocking, _ := metadata["blockingReviewEvent"].(string)
+	expectedCommitID, _ := metadata["expectedCommitID"].(string)
+	reviewerManual, _ := metadata["reviewerManual"].(bool)
+	reviewerRunID, _ := metadata["reviewerRunID"].(string)
+	return forge.TrustedReviewProxyPolicy{
+		Clean:            strings.TrimSpace(clean),
+		Blocking:         strings.TrimSpace(blocking),
+		ExpectedCommitID: strings.TrimSpace(expectedCommitID),
+		ReviewerManual:   reviewerManual,
+		ReviewerRunID:    strings.TrimSpace(reviewerRunID),
+	}
+}
+
+func metadataInt64(value any) (int64, bool) {
+	switch n := value.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case float64:
+		if n != float64(int64(n)) {
+			return 0, false
+		}
+		return int64(n), true
+	case float32:
+		if n != float32(int64(n)) {
+			return 0, false
+		}
+		return int64(n), true
+	case json.Number:
+		parsed, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+// reviewerTrustedReviewAgentIdentity returns vendor/model for the trusted
+// review-submit config snapshot. Run snapshot fields are authority when
+// UseSnapshot is set with a non-empty vendor; otherwise the role-resolved
+// adapter identity is used.
+func reviewerTrustedReviewAgentIdentity(input reviewer.AgentRunInput, fallbackVendor config.AgentVendor, fallbackModel *string) (config.AgentVendor, *string) {
+	if input.UseSnapshot {
+		if vendor := strings.TrimSpace(input.SnapshotVendor); vendor != "" {
+			return config.AgentVendor(vendor), input.SnapshotModel
+		}
+	}
+	return fallbackVendor, fallbackModel
+}
+
+// materializeTrustedReviewAgentIdentity copies cfg and overwrites
+// Agent.Vendor/Model so disclosure.FromConfig in the trusted review child
+// matches the reviewer execution identity.
+func materializeTrustedReviewAgentIdentity(cfg config.Config, vendor config.AgentVendor, model *string) config.Config {
+	if strings.TrimSpace(string(vendor)) != "" {
+		v := vendor
+		cfg.Agent.Vendor = &v
+	} else {
+		cfg.Agent.Vendor = nil
+	}
+	if model != nil {
+		m := *model
+		cfg.Agent.Model = &m
+	} else {
+		cfg.Agent.Model = nil
+	}
+	return cfg
+}
+
+func (a reviewerAgentExecutorAdapter) Start(ctx context.Context, input reviewer.AgentRunInput) (reviewer.AgentExecution, error) {
+	// Mint a per-run proxy only for review/publish phases on projects that
+	// publish native reviews, bound to the daemon-selected PR, worktree CWD,
+	// and review-events policy. Thread-resolution classifiers and summary_comment
+	// (comment-only) runs reuse this adapter but must not receive review-publish
+	// capability via LOOPER_TRUSTED_REVIEW_SOCK.
+	sock := ""
+	var trustedReview *forge.TrustedReviewAuthority
+	_, hostingSelected := hostingidentity.FromContext(ctx)
+	proxyCleanup := func() {}
+	if reviewerAllowsTrustedReviewProxy(a.config, input.ProjectID, input.Metadata) {
+		allowedPR := reviewerAllowedPRRef(input.Metadata)
+		allowedCwd := strings.TrimSpace(input.WorkingDirectory)
+		policy := reviewerAllowedReviewPolicy(input.Metadata)
+		if policy.ReviewerRunID != "" && policy.ReviewerRunID != strings.TrimSpace(input.RunID) {
+			return nil, fmt.Errorf("install run-bound trusted review proxy: reviewer run id does not match agent run")
+		}
+		if hostingSelected {
+			trustedReview = &forge.TrustedReviewAuthority{PRRef: allowedPR, Policy: policy}
+		} else {
+			vendor, model := reviewerTrustedReviewAgentIdentity(input, a.agentVendor, a.agentModel)
+			configSnapshot := materializeTrustedReviewAgentIdentity(*a.config, vendor, model)
+			var err error
+			sock, proxyCleanup, err = mintTrustedReviewProxyForPR(a.realLooper, a.trustedEnv, allowedPR, allowedCwd, configSnapshot, policy, a.tracker)
+			if err != nil {
+				return nil, fmt.Errorf("install run-bound trusted review proxy: %w", err)
+			}
+		}
+	}
+	execution, err := a.executor.Start(ctx, agent.RunInput{
+		ExecutionID:         input.ExecutionID,
+		ProjectID:           input.ProjectID,
+		LoopID:              input.LoopID,
+		RunID:               input.RunID,
+		Prompt:              input.Prompt,
+		NativeResumePrompt:  input.NativeResumePrompt,
+		DisableNativeResume: input.DisableNativeResume,
+		WorkingDirectory:    input.WorkingDirectory,
+		Timeout:             input.Timeout,
+		HeartbeatTimeout:    input.HeartbeatTimeout,
+		Metadata:            input.Metadata,
+		IdempotencyKey:      input.IdempotencyKey,
+		Env:                 reviewerTrustedReviewEnv(sock),
+		TrustedReview:       trustedReview,
+		UseSnapshot:         input.UseSnapshot,
+		SnapshotVendor:      input.SnapshotVendor,
+		SnapshotModel:       input.SnapshotModel,
+	})
+	if err != nil {
+		proxyCleanup()
+		return nil, err
+	}
+	return &reviewerAgentExecutionAdapter{execution: execution, cleanup: proxyCleanup}, nil
+}
+
+func (a *reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.AgentResult, error) {
+	defer a.closeProxy()
 	result, err := a.execution.Wait(ctx)
 	if err != nil {
 		return reviewer.AgentResult{}, err
@@ -949,7 +2220,8 @@ func (a reviewerAgentExecutionAdapter) Wait(ctx context.Context) (reviewer.Agent
 	return reviewer.AgentResult{Status: result.Status, Summary: result.Summary, Stdout: result.Stdout, Stderr: result.Stderr, ParseStatus: result.ParseStatus, TimeoutType: result.TimeoutType, ConfiguredIdleTimeoutSeconds: result.ConfiguredIdleTimeoutSeconds, ConfiguredMaxRuntimeSeconds: result.ConfiguredMaxRuntimeSeconds, ElapsedRuntimeSeconds: result.ElapsedRuntimeSeconds, LastProgressAt: result.LastProgressAt}, nil
 }
 
-func (a reviewerAgentExecutionAdapter) Kill(reason string) error {
+func (a *reviewerAgentExecutionAdapter) Kill(reason string) error {
+	defer a.closeProxy()
 	return a.execution.Kill(reason)
 }
 
@@ -959,34 +2231,48 @@ type fixerGitHubAdapter struct {
 	config  *config.Config
 }
 
-func (a fixerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForRepo(a.config, repo)
+func (a fixerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
 	return client, ok, err
 }
 
 func (a fixerGitHubAdapter) forgejoForCWD(ctx context.Context, cwd string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForCWD(a.config, cwd)
+	client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd)
 	return client, ok, err
 }
 
 func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixer.ListOpenPullRequestsInput) ([]fixer.PullRequestSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
-		if strings.TrimSpace(input.Author) != "" {
-			return nil, fmt.Errorf("forgejo fixer does not support author-filter discovery")
+		effectiveLimit := input.Limit
+		if effectiveLimit <= 0 {
+			effectiveLimit = 30
 		}
-		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: input.Limit, Labels: appendLabels(input.Label, input.Labels)})
+		limit := effectiveLimit
+		if strings.TrimSpace(input.Author) != "" || strings.TrimSpace(input.BaseRefName) != "" {
+			// Forgejo's pull listing surface does not provide a reliable author
+			// or base filter. Fetch the matching label set before applying the limit
+			// so a busy repository cannot hide matching PRs behind other results.
+			limit = 0
+		}
+		pullRequests, err := client.ListOpenPullRequests(ctx, forge.ListPullRequestsInput{Limit: limit, Labels: appendLabels(input.Label, input.Labels)})
 		if err != nil {
 			return nil, err
 		}
-		result := make([]fixer.PullRequestSummary, 0, len(pullRequests))
+		result := make([]fixer.PullRequestSummary, 0, min(len(pullRequests), effectiveLimit))
 		for _, pr := range pullRequests {
+			if strings.TrimSpace(input.Author) != "" && !strings.EqualFold(strings.TrimSpace(pr.User.Login), strings.TrimSpace(input.Author)) {
+				continue
+			}
 			if input.BaseRefName != "" && pr.Base.Name != input.BaseRefName {
 				continue
 			}
 			result = append(result, fixer.PullRequestSummary{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, Author: pr.User.Login})
+			if len(result) >= effectiveLimit {
+				break
+			}
 		}
 		return result, nil
 	}
@@ -1004,48 +2290,157 @@ func (a fixerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input fixe
 func (a fixerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
 	if client, ok, err := a.forgejoForCWD(ctx, cwd); ok || err != nil {
 		if err != nil {
-			return "", err
+			// Client construction / project resolution failures are local and
+			// deterministic; do not tag them as hosting-API transport errors.
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		identity, err := client.CurrentUser(ctx)
-		return identity.Login, err
+		if err != nil {
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		}
+		return identity.Login, nil
 	}
-	return a.gateway.GetCurrentUserLogin(ctx, cwd)
+	login, err := a.gateway.GetCurrentUserLogin(ctx, cwd)
+	if err != nil {
+		return "", withHostingAPIBoundary(err)
+	}
+	login = strings.TrimSpace(login)
+	if login != "" {
+		return login, nil
+	}
+	ident, identErr := a.gateway.GetCurrentUserIdentity(ctx, cwd)
+	if identErr != nil {
+		return "", withHostingAPIBoundary(identErr)
+	}
+	return strings.TrimSpace(ident.Login), nil
 }
 
 func (a fixerGitHubAdapter) GetPullRequestAuthor(ctx context.Context, input fixer.ViewPullRequestInput) (string, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
-			return "", err
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
 		if err != nil {
-			return "", err
+			return "", failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		return pr.User.Login, nil
 	}
-	return a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	author, err := a.gateway.GetPullRequestAuthor(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return "", withHostingAPIBoundary(err)
+	}
+	return author, nil
 }
 
 func (a fixerGitHubAdapter) ViewPullRequest(ctx context.Context, input fixer.ViewPullRequestInput) (fixer.PullRequestDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryConfig)
 		}
 		pr, err := client.ViewPullRequest(ctx, input.PRNumber)
 		if err != nil {
-			return fixer.PullRequestDetail{}, err
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
 		}
 		comments, err := client.ListIssueComments(ctx, input.PRNumber)
 		if err != nil {
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		}
+		checks, err := client.ListCommitChecks(ctx, pr.Head.SHA)
+		if err != nil {
+			return fixer.PullRequestDetail{}, failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+		}
+		conflicted, err := forgejoPullRequestHasConflicts(ctx, a.config, input.Repo, input.CWD, pr)
+		if err != nil {
 			return fixer.PullRequestDetail{}, err
 		}
-		return fixer.PullRequestDetail{Number: pr.Number, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Author: pr.User.Login}, nil
+		return fixer.PullRequestDetail{Number: pr.Number, URL: pr.HTMLURL, State: pr.State, IsDraft: pr.IsDraft, Labels: forgeLabelNames(pr.Labels), HeadSHA: pr.Head.SHA, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, BaseSHA: pr.Base.SHA, IssueComments: forgeCommentsToObjects(comments), Checks: forgeChecksToObjects(checks), HasConflicts: conflicted, Author: pr.User.Login}, nil
 	}
 	detail, err := a.gateway.ViewPullRequestForFixer(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
 	if err != nil {
-		return fixer.PullRequestDetail{}, err
+		return fixer.PullRequestDetail{}, withHostingAPIBoundary(err)
 	}
 	return fixer.PullRequestDetail{Number: detail.Number, State: detail.State, IsDraft: detail.IsDraft, Labels: detail.Labels, HeadSHA: detail.HeadSHA, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, BaseSHA: detail.BaseSHA, ReviewDecision: detail.ReviewDecision, Comments: detail.Comments, IssueComments: commentInfosToObjects(detail.IssueComments), Checks: detail.Checks, HasConflicts: detail.HasConflicts, Author: detail.Author}, nil
+}
+
+// withHostingAPIBoundary tags remote GitHub/hosting transport failures as
+// BoundaryGitHubAPI. Deterministic local CLI failures keep BoundaryConfig so
+// unlimited fixer queues request intervention instead of retrying forever:
+//   - launch failures: missing/moved gh, inaccessible CWD, bad permissions
+//   - completed CLI contract failures: incompatible gh schema/invocation
+//     (e.g. unknown --json field), zero-exit invalidJSONError payloads
+//     ("Invalid gh JSON payload"), and local shell capture truncation
+//     ("GitHub command output truncated" / Result truncation flags)
+//
+// Transient host-pressure launch failures (EAGAIN, ENOMEM, ETXTBSY, EMFILE,
+// ENFILE after the short shell retry) stay BoundaryGitHubAPI so Classify
+// leaves them retryable.
+func withHostingAPIBoundary(err error) error {
+	if err == nil {
+		return nil
+	}
+	if shell.IsStartFailure(err) && !shell.IsTransientStartFailure(err) {
+		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
+	}
+	if isLocalCLIContractFailure(err) {
+		return failureclass.WithBoundary(err, failureclass.BoundaryConfig)
+	}
+	return failureclass.WithBoundary(err, failureclass.BoundaryGitHubAPI)
+}
+
+// isLocalCLIContractFailure reports whether err is a successfully-launched
+// CLI failure from local invocation/schema/output-contract incompatibility
+// rather than a remote hosting API response. Examples:
+//   - gh pr view --json rejects a field (`unknown JSON field: "..."`) and
+//     exits nonzero — not IsStartFailure, but deterministic local mismatch
+//   - gh exits 0 with malformed/empty JSON and gateway emits
+//     `Invalid gh JSON payload` via invalidJSONError — still local decode
+//     contract, not a remote transport outage
+//   - shell capture exceeds the 256 KiB bound: runGhWithTimeout returns
+//     CommandExecutionError with StdoutTruncated/StderrTruncated and message
+//     "GitHub command output truncated" — local buffer limit, not API outage
+//
+// Retrying forever under BoundaryGitHubAPI cannot fix these deterministic
+// CLI-output contract failures.
+func isLocalCLIContractFailure(err error) bool {
+	if err == nil || shell.IsStartFailure(err) {
+		return false
+	}
+	var commandErr *shell.CommandExecutionError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	// Prefer structural truncation flags from the shell Result; gateway
+	// runGhWithTimeout sets these when the local capture limit is hit.
+	if commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+		return true
+	}
+	message := strings.ToLower(strings.Join([]string{
+		commandErr.Message,
+		commandErr.Result.Stdout,
+		commandErr.Result.Stderr,
+	}, "\n"))
+	return isLocalCLIContractMessage(message)
+}
+
+func isLocalCLIContractMessage(message string) bool {
+	for _, fragment := range []string{
+		"unknown json field",
+		"invalid gh json payload",         // zero-exit decode/shape failures from invalidJSONError
+		"github command output truncated", // local shell capture limit (flags may be lost after wrap)
+		"unknown flag",
+		"flag provided but not defined",
+		"unknown command",
+		"accepts at most",
+		"accepts between",
+		"requires at least",
+		"required flag",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func forgeCommentsToObjects(items []forge.Comment) []map[string]any {
@@ -1079,13 +2474,13 @@ func commentInfosToObjects(items []githubinfra.CommentInfo) []map[string]any {
 }
 
 func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.ListReviewThreadsInput) ([]fixer.ReviewThread, error) {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
 		return nil, fmt.Errorf("forgejo fixer does not support native review threads")
 	}
-	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit})
+	threads, err := a.gateway.ListReviewThreads(ctx, githubinfra.ListReviewThreadsInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD, Limit: input.Limit, AllPages: input.AllPages})
 	if err != nil {
 		return nil, err
 	}
@@ -1093,7 +2488,7 @@ func (a fixerGitHubAdapter) ListReviewThreads(ctx context.Context, input fixer.L
 	for _, thread := range threads {
 		comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 		for _, comment := range thread.Comments {
-			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
+			comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 		}
 		out = append(out, fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments})
 	}
@@ -1113,13 +2508,13 @@ func (a fixerGitHubAdapter) ViewReviewThread(ctx context.Context, input fixer.Vi
 	}
 	comments := make([]fixer.ReviewThreadComment, 0, len(thread.Comments))
 	for _, comment := range thread.Comments {
-		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
+		comments = append(comments, fixer.ReviewThreadComment{ID: comment.ID, Body: comment.Body, Author: comment.Author, AuthorAssociation: comment.AuthorAssociation, CreatedAt: comment.CreatedAt, UpdatedAt: comment.UpdatedAt})
 	}
 	return fixer.ReviewThread{ID: thread.ID, IsResolved: thread.IsResolved, Comments: comments}, nil
 }
 
 func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer.ResolveReviewThreadInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1128,27 +2523,78 @@ func (a fixerGitHubAdapter) ResolveReviewThread(ctx context.Context, input fixer
 	return a.gateway.ResolveReviewThread(ctx, githubinfra.ResolveReviewThreadInput{Repo: input.Repo, ThreadID: input.ThreadID, CWD: input.CWD})
 }
 
+func (a fixerGitHubAdapter) ListNativeReviewComments(ctx context.Context, input fixer.ListNativeReviewCommentsInput) ([]fixer.NativeReviewComment, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		comments, err := client.ListPullRequestReviewComments(ctx, input.PRNumber)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]fixer.NativeReviewComment, 0, len(comments))
+		for _, comment := range comments {
+			out = append(out, fixer.NativeReviewComment{
+				ProviderCommentID:   comment.ID,
+				Body:                comment.Body,
+				URL:                 comment.HTMLURL,
+				Path:                comment.Path,
+				DiffHunk:            comment.DiffHunk,
+				ObservedFingerprint: fixer.NativeReviewCommentFingerprint(comment.ID, comment.Body),
+				ResolverPresent:     comment.Resolver.Present,
+				IsResolved:          comment.Resolver.Value != nil,
+				Author:              comment.User.Login,
+				UpdatedAt:           comment.UpdatedAt,
+				ReviewBody:          comment.ReviewBody,
+				ReviewState:         comment.ReviewState,
+				ReviewCommitID:      comment.ReviewCommitID,
+				ReviewAuthor:        comment.ReviewAuthor,
+			})
+		}
+		return out, nil
+	}
+	return nil, nil
+}
+
+func (a fixerGitHubAdapter) ProbeNativeReviewCommentResolution(ctx context.Context, input fixer.ListNativeReviewCommentsInput) (forge.ProbeState, error) {
+	_, provider, ok, err := forgejoProjectProviderForCWD(a.config, input.CWD)
+	if err != nil {
+		return forge.ProbeStateUnknown, err
+	}
+	if !ok {
+		return forge.ProbeStateSupported, nil
+	}
+	return forge.ProbeForgejoReviewCommentResolution(ctx, provider, input.Repo)
+}
+
+func (a fixerGitHubAdapter) ResolveNativeReviewComment(ctx context.Context, input fixer.ResolveNativeReviewCommentInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.ResolvePullRequestReviewComment(ctx, input.PRNumber, input.ProviderCommentID)
+	}
+	return fmt.Errorf("github fixer does not support native review comment resolution")
+}
+
 func (a fixerGitHubAdapter) AddReviewThreadReply(ctx context.Context, input fixer.AddReviewThreadReplyInput) error {
-	if _, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
 		return fmt.Errorf("forgejo fixer does not support native review thread replies")
 	}
-	body := a.stamper.ReviewComment(input.Body, "fixer")
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).ReviewComment(input.Body, "fixer")
 	return a.gateway.AddReviewThreadReply(ctx, githubinfra.AddReviewThreadReplyInput{Repo: input.Repo, ThreadID: input.ThreadID, Body: body, CWD: input.CWD})
 }
 
 func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.CompareCommitsInput) (fixer.CompareCommitsResult, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if _, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return fixer.CompareCommitsResult{}, err
 		}
-		out, err := client.CompareBranches(ctx, forge.CompareBranchesInput{Base: input.Base, Head: input.Head})
-		if err != nil {
-			return fixer.CompareCommitsResult{}, err
-		}
-		return fixer.CompareCommitsResult{Status: out.Status}, nil
+		status, err := forgejoCompareCommits(ctx, a.config, input.Repo, input.CWD, input.Base, input.Head)
+		return fixer.CompareCommitsResult{Status: status}, err
 	}
 	out, err := a.gateway.CompareCommits(ctx, githubinfra.CompareCommitsInput{Repo: input.Repo, Base: input.Base, Head: input.Head, CWD: input.CWD})
 	if err != nil {
@@ -1158,8 +2604,8 @@ func (a fixerGitHubAdapter) CompareCommits(ctx context.Context, input fixer.Comp
 }
 
 func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.IssueCommentInput) (fixer.IssueCommentResult, error) {
-	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return fixer.IssueCommentResult{}, err
 		}
@@ -1177,8 +2623,8 @@ func (a fixerGitHubAdapter) CreateIssueComment(ctx context.Context, input fixer.
 }
 
 func (a fixerGitHubAdapter) UpdateIssueComment(ctx context.Context, input fixer.UpdateIssueCommentInput) error {
-	body := a.stamper.Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "fixer", disclosure.ChannelIssueComment)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1189,7 +2635,7 @@ func (a fixerGitHubAdapter) UpdateIssueComment(ctx context.Context, input fixer.
 }
 
 func (a fixerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1200,7 +2646,7 @@ func (a fixerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input fixe
 }
 
 func (a fixerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input fixer.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1212,6 +2658,52 @@ func (a fixerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input f
 		return nil
 	}
 	return a.gateway.RemovePullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input fixer.PullRequestReviewersInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
+	}
+	return a.gateway.AddPullRequestReviewers(ctx, githubinfra.PullRequestReviewersInput{Repo: input.Repo, PRNumber: input.PRNumber, Reviewers: input.Reviewers, CWD: input.CWD})
+}
+
+func (a fixerGitHubAdapter) ListPullRequestReviews(ctx context.Context, input fixer.ViewPullRequestInput) ([]fixer.ReviewSummary, error) {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		reviews, err := client.ListPullRequestReviewSummaries(ctx, input.PRNumber)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]fixer.ReviewSummary, 0, len(reviews))
+		for _, review := range reviews {
+			out = append(out, fixer.ReviewSummary{ID: review.ID, State: review.State, Author: review.User.Login, Body: review.Body})
+		}
+		return out, nil
+	}
+	reviews, err := a.gateway.ListPullRequestReviews(ctx, githubinfra.ViewPullRequestInput{Repo: input.Repo, PRNumber: input.PRNumber, CWD: input.CWD})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fixer.ReviewSummary, 0, len(reviews))
+	for _, rv := range reviews {
+		out = append(out, fixer.ReviewSummary{ID: rv.ID, State: rv.State, Author: rv.Author, Body: rv.Body})
+	}
+	return out, nil
+}
+
+func (a fixerGitHubAdapter) DismissReview(ctx context.Context, input fixer.DismissReviewInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.DismissPullRequestReview(ctx, input.PRNumber, input.ReviewID, input.Message)
+	}
+	return a.gateway.DismissReview(ctx, githubinfra.DismissReviewInput{Repo: input.Repo, PRNumber: input.PRNumber, ReviewID: input.ReviewID, Message: input.Message, CWD: input.CWD})
 }
 
 type fixerGitAdapter struct {
@@ -1244,7 +2736,7 @@ func (a fixerGitAdapter) InspectHead(ctx context.Context, input fixer.InspectHea
 }
 
 func (a fixerGitAdapter) Commit(ctx context.Context, input fixer.CommitInput) (fixer.CommitResult, error) {
-	message := a.stamper.CommitMessage(input.Message, "fixer")
+	message := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).CommitMessage(input.Message, "fixer")
 	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return fixer.CommitResult{}, err
@@ -1260,6 +2752,14 @@ func (a fixerGitAdapter) FetchBranch(ctx context.Context, repoPath, remote, bran
 	return a.gateway.FetchBranch(ctx, repoPath, remote, branch)
 }
 
+func (a fixerGitAdapter) MergeBaseIntoWorktree(ctx context.Context, input fixer.MergeBaseInput) (fixer.MergeBaseResult, error) {
+	res, err := a.gateway.MergeBaseIntoWorktree(ctx, gitinfra.MergeBaseInput{WorktreePath: input.WorktreePath, Remote: input.Remote, BaseBranch: input.BaseBranch})
+	if err != nil {
+		return fixer.MergeBaseResult{}, err
+	}
+	return fixer.MergeBaseResult{AlreadyUpToDate: res.AlreadyUpToDate, Conflicted: res.Conflicted}, nil
+}
+
 func (a fixerGitAdapter) IsAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
 	return a.gateway.IsAncestor(ctx, repoPath, ancestor, descendant)
 }
@@ -1272,7 +2772,13 @@ type fixerAgentExecutorAdapter struct{ executor *agent.ConfiguredExecutor }
 type fixerAgentExecutionAdapter struct{ execution agent.Execution }
 
 func (a fixerAgentExecutorAdapter) Start(ctx context.Context, input fixer.AgentRunInput) (fixer.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	execution, err := a.executor.Start(ctx, agent.RunInput{
+		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
+		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
+		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1293,13 +2799,21 @@ type workerGitHubAdapter struct {
 	config  *config.Config
 }
 
-func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string) (*forge.ForgejoClient, bool, error) {
-	client, ok, err := forgejoClientForRepo(a.config, repo)
+func (a workerGitHubAdapter) forgejo(ctx context.Context, repo string, cwd ...string) (*forge.ForgejoClient, bool, error) {
+	client, ok, err := forgejoClientForContext(ctx, a.config, repo, cwd...)
+	return client, ok, err
+}
+
+// plane returns a Plane task-source client when repo belongs to a plane-kind
+// project. The worker reads issues and posts issue-side comments/labels through
+// Plane; pull-request creation stays on the GitHub code repo.
+func (a workerGitHubAdapter) plane(ctx context.Context, repo string, cwd ...string) (*forge.PlaneClient, bool, error) {
+	client, ok, err := forgeClientForLocation(a.config, repo, cwd, planeClientForCWD, planeClientForRepo)
 	return client, ok, err
 }
 
 func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input worker.ListOpenPullRequestsInput) ([]worker.PullRequestSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
@@ -1328,11 +2842,25 @@ func (a workerGitHubAdapter) ListOpenPullRequests(ctx context.Context, input wor
 }
 
 func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.ListOpenIssuesInput) ([]worker.IssueSummary, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return nil, err
 		}
 		issues, err := client.ListOpenIssues(ctx, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit})
+		if err != nil {
+			return nil, err
+		}
+		result := make([]worker.IssueSummary, 0, len(issues))
+		for _, issue := range issues {
+			result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, Assignees: forgeIdentityLogins(issue.Assignees), AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)})
+		}
+		return result, nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		issues, err := forgejoDiscoveryIssues(ctx, client, forge.ListIssuesInput{Labels: input.Labels, Assignee: input.Assignee, Limit: input.Limit}, input.IssueNumber)
 		if err != nil {
 			return nil, err
 		}
@@ -1351,13 +2879,20 @@ func (a workerGitHubAdapter) ListOpenIssues(ctx context.Context, input worker.Li
 	}
 	result := make([]worker.IssueSummary, 0, len(issues))
 	for _, issue := range issues {
-		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Assignees: issue.Assignees, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels})
+		result = append(result, worker.IssueSummary{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.URL, Author: issue.Author, Assignees: issue.Assignees, AssigneeUsers: networkPolicyUsers(issue.AssigneeUsers), Labels: issue.Labels})
 	}
 	return result, nil
 }
 
 func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string) (string, error) {
-	if client, ok, err := forgejoClientForCWD(a.config, cwd); ok || err != nil {
+	if client, ok, err := planeClientForCWD(a.config, cwd); ok || err != nil {
+		if err != nil {
+			return "", err
+		}
+		identity, err := client.CurrentUser(ctx)
+		return identity.Login, err
+	}
+	if client, ok, err := forgejoClientForContext(ctx, a.config, "", cwd); ok || err != nil {
 		if err != nil {
 			return "", err
 		}
@@ -1371,7 +2906,13 @@ func (a workerGitHubAdapter) GetCurrentUserLogin(ctx context.Context, cwd string
 }
 
 func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker.IssueAssigneesInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return client.AddIssueAssignees(ctx, input.IssueNumber, input.Assignees)
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1384,7 +2925,7 @@ func (a workerGitHubAdapter) AddIssueAssignees(ctx context.Context, input worker
 }
 
 func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.ViewPullRequestInput) (worker.PullRequestDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.PullRequestDetail{}, err
 		}
@@ -1392,7 +2933,7 @@ func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.V
 		if err != nil {
 			return worker.PullRequestDetail{}, err
 		}
-		return worker.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA}, nil
+		return worker.PullRequestDetail{Number: pr.Number, Title: pr.Title, Body: pr.Body, URL: pr.HTMLURL, State: pr.State, HeadRefName: pr.Head.Name, BaseRefName: pr.Base.Name, HeadSHA: pr.Head.SHA, Labels: forgeLabelNames(pr.Labels)}, nil
 	}
 	if a.gateway == nil {
 		return worker.PullRequestDetail{}, fmt.Errorf("github gateway is not configured")
@@ -1401,11 +2942,21 @@ func (a workerGitHubAdapter) ViewPullRequest(ctx context.Context, input worker.V
 	if err != nil {
 		return worker.PullRequestDetail{}, err
 	}
-	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers)}, nil
+	return worker.PullRequestDetail{Number: detail.Number, Title: detail.Title, Body: detail.Body, URL: detail.URL, State: detail.State, HeadRefName: detail.HeadRefName, BaseRefName: detail.BaseRefName, HeadSHA: detail.HeadSHA, Labels: append([]string(nil), detail.Labels...), ReviewRequests: detail.ReviewRequests, ReviewRequestUsers: networkPolicyUsers(detail.ReviewRequestUsers)}, nil
 }
 
 func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIssueInput) (worker.IssueDetail, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return worker.IssueDetail{}, err
+		}
+		issue, err := client.ViewIssue(ctx, input.IssueNumber)
+		if err != nil {
+			return worker.IssueDetail{}, err
+		}
+		return worker.IssueDetail{Number: issue.Number, Title: issue.Title, Body: issue.Body, URL: issue.HTMLURL, State: issue.State, AssigneeUsers: forgeNetworkPolicyUsers(issue.Assignees), Labels: forgeLabelNames(issue.Labels)}, nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.IssueDetail{}, err
 		}
@@ -1426,8 +2977,20 @@ func (a workerGitHubAdapter) ViewIssue(ctx context.Context, input worker.ViewIss
 }
 
 func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worker.IssueCommentInput) (worker.IssueCommentResult, error) {
-	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	if client, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return worker.IssueCommentResult{}, err
+		}
+		comment, err := client.CreateIssueComment(ctx, forge.CreateCommentInput{IssueNumber: input.IssueNumber, Body: body})
+		if err != nil {
+			return worker.IssueCommentResult{}, err
+		}
+		// Plane comment ids are UUIDs and do not fit looper's int64 comment id, so
+		// ID stays 0; the URL points at the work-item web page.
+		return worker.IssueCommentResult{ID: comment.ID, URL: comment.HTMLURL}, nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.IssueCommentResult{}, err
 		}
@@ -1448,8 +3011,19 @@ func (a workerGitHubAdapter) CreateIssueComment(ctx context.Context, input worke
 }
 
 func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worker.UpdateIssueCommentInput) error {
-	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelIssueComment)
+	if _, ok, err := a.plane(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		// Plane comment ids are UUIDs, which do not round-trip through looper's
+		// int64 comment id, so in-place updates are not supported. This is a
+		// no-op: the worker's CreateIssueComment path (which returns id 0) posts a
+		// fresh progress comment on each status transition instead.
+		// TODO(plane): track the Plane comment UUID to enable true updates.
+		return nil
+	}
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1463,8 +3037,8 @@ func (a workerGitHubAdapter) UpdateIssueComment(ctx context.Context, input worke
 }
 
 func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker.CreatePullRequestInput) (worker.CreatePullRequestResult, error) {
-	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.CreatePullRequestResult{}, err
 		}
@@ -1477,15 +3051,52 @@ func (a workerGitHubAdapter) CreatePullRequest(ctx context.Context, input worker
 	if a.gateway == nil {
 		return worker.CreatePullRequestResult{}, fmt.Errorf("github gateway is not configured")
 	}
-	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, CWD: input.CWD})
+	pr, err := a.gateway.CreatePullRequest(ctx, githubinfra.CreatePullRequestInput{Repo: input.Repo, HeadBranch: input.HeadBranch, BaseBranch: input.BaseBranch, Title: input.Title, Body: body, Draft: input.Draft, CWD: input.CWD})
 	if err != nil {
 		return worker.CreatePullRequestResult{}, err
 	}
 	return worker.CreatePullRequestResult{Number: pr.Number, URL: pr.URL}, nil
 }
 
+func (a workerGitHubAdapter) AddPullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		_, err := client.AddIssueLabels(ctx, input.PRNumber, input.Labels)
+		return err
+	}
+	if a.gateway == nil {
+		return fmt.Errorf("github gateway is not configured")
+	}
+	return a.gateway.AddPullRequestLabels(ctx, githubinfra.PullRequestLabelsInput{Repo: input.Repo, PRNumber: input.PRNumber, Labels: input.Labels, CWD: input.CWD})
+}
+
+// providerHasGitHubPullRequests reports whether a project of this provider kind
+// has its pull requests on GitHub — so the coordinator/fixer PR-follow-up lanes
+// apply. GitHub projects obviously do; Plane projects too (Plane is the task
+// source, but the code + PRs live on the bound GitHub repo).
+func providerHasGitHubPullRequests(kind config.ProviderKind) bool {
+	return kind == config.ProviderKindGitHub || kind == config.ProviderKindPlane
+}
+
+func providerSupportsFixerDiscovery(kind config.ProviderKind) bool {
+	return providerHasGitHubPullRequests(kind) || kind == config.ProviderKindForgejo
+}
+
+// hitlGitHubSettings maps the HITL GitHub config into the worker's settings.
+func hitlGitHubSettings(cfg *config.HITLGitHubConfig) worker.HITLGitHubSettings {
+	if cfg == nil {
+		return worker.HITLGitHubSettings{}
+	}
+	return worker.HITLGitHubSettings{
+		AwaitingLabel: cfg.AwaitingLabel,
+		MentionLogins: append([]string(nil), cfg.MentionLogins...),
+	}
+}
+
 func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.CompareBranchesInput) (worker.CompareBranchesResult, error) {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return worker.CompareBranchesResult{}, err
 		}
@@ -1506,8 +3117,8 @@ func (a workerGitHubAdapter) CompareBranches(ctx context.Context, input worker.C
 }
 
 func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input worker.UpdatePullRequestBodyInput) error {
-	body := a.stamper.Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	body := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).Markdown(input.Body, "worker", disclosure.ChannelPullRequest)
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1521,7 +3132,7 @@ func (a workerGitHubAdapter) UpdatePullRequestBody(ctx context.Context, input wo
 }
 
 func (a workerGitHubAdapter) UpdatePullRequestTitle(ctx context.Context, input worker.UpdatePullRequestTitleInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1535,7 +3146,7 @@ func (a workerGitHubAdapter) UpdatePullRequestTitle(ctx context.Context, input w
 }
 
 func (a workerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input worker.PullRequestLabelsInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
@@ -1553,17 +3164,11 @@ func (a workerGitHubAdapter) RemovePullRequestLabels(ctx context.Context, input 
 }
 
 func (a workerGitHubAdapter) AddPullRequestReviewers(ctx context.Context, input worker.PullRequestReviewersInput) error {
-	if client, ok, err := a.forgejo(ctx, input.Repo); ok || err != nil {
+	if client, ok, err := a.forgejo(ctx, input.Repo, input.CWD); ok || err != nil {
 		if err != nil {
 			return err
 		}
-		labels := forgejoReviewerDiscoveryLabelsForRepo(a.config, input.Repo)
-		if len(labels) > 0 {
-			if _, err := client.AddIssueLabels(ctx, input.PRNumber, labels); err != nil {
-				return err
-			}
-		}
-		return nil
+		return addForgejoPullRequestReviewers(ctx, client, a.config, input.Repo, input.PRNumber, input.Reviewers, input.CWD)
 	}
 	if a.gateway == nil {
 		return fmt.Errorf("github gateway is not configured")
@@ -1609,7 +3214,7 @@ func (a workerGitAdapter) InspectHead(ctx context.Context, input worker.InspectH
 }
 
 func (a workerGitAdapter) Commit(ctx context.Context, input worker.CommitInput) (worker.CommitResult, error) {
-	message := a.stamper.CommitMessage(input.Message, "worker")
+	message := a.stamper.WithIdentity(input.DisclosureAgent, input.DisclosureModel).CommitMessage(input.Message, "worker")
 	result, err := a.gateway.Commit(ctx, gitinfra.CommitInput{RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot, WorktreePath: input.WorktreePath, Message: message})
 	if err != nil {
 		return worker.CommitResult{}, err
@@ -1623,25 +3228,24 @@ func (a workerGitAdapter) Push(ctx context.Context, input worker.PushInput) erro
 
 type workerAgentExecutorAdapter struct {
 	executor *agent.ConfiguredExecutor
-	registry *ActiveExecutionRegistry
 }
 type workerAgentExecutionAdapter struct {
 	execution agent.Execution
 }
 
 func (a workerAgentExecutorAdapter) Start(ctx context.Context, input worker.AgentRunInput) (worker.AgentExecution, error) {
-	execution, err := a.executor.Start(ctx, agent.RunInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Prompt: input.Prompt, WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout, Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey})
+	// Ownership is acquired at the common executor boundary (AdmitSpawn +
+	// BindHandle), not via post-spawn role-adapter registration (#576 / not #572).
+	execution, err := a.executor.Start(ctx, agent.RunInput{
+		ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID,
+		Prompt: input.Prompt, NativeResumePrompt: input.NativeResumePrompt, NativeSessionID: input.NativeSessionID,
+		WorkingDirectory: input.WorkingDirectory, Timeout: input.Timeout, HeartbeatTimeout: input.HeartbeatTimeout,
+		Metadata: input.Metadata, IdempotencyKey: input.IdempotencyKey,
+		UseSnapshot: input.UseSnapshot, SnapshotVendor: input.SnapshotVendor, SnapshotModel: input.SnapshotModel,
+	})
 	if err != nil {
 		return nil, err
 	}
-	unregister := func() {}
-	if a.registry != nil {
-		unregister = a.registry.Register(input.LoopID, input.RunID, input.ExecutionID, execution)
-	}
-	go func() {
-		_, _ = execution.Wait(context.Background())
-		unregister()
-	}()
 	return workerAgentExecutionAdapter{execution: execution}, nil
 }
 
@@ -1657,7 +3261,139 @@ func (a workerAgentExecutionAdapter) Kill(reason string) error {
 	return a.execution.Kill(reason)
 }
 
+type schedulerNotificationGatewayFactory struct {
+	state         *notify.GatewayState
+	feishuAppHTTP notify.FeishuAppHTTPFunc
+}
+
+func newSchedulerNotificationGatewayFactory() *schedulerNotificationGatewayFactory {
+	return &schedulerNotificationGatewayFactory{state: notify.NewGatewayState()}
+}
+
+func (f *schedulerNotificationGatewayFactory) New(options notify.Options) *notify.Gateway {
+	if options.FeishuAppHTTP == nil {
+		options.FeishuAppHTTP = f.feishuAppHTTP
+	}
+	options.State = f.state
+	return notify.NewGateway(options)
+}
+
+func buildCatalogSchedulerHandlers(source projects.ConfigSource, claimBoundary *sync.RWMutex, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), allowClaim func() error, withAllowClaim func(fn func()) error, notifyHumanAttention func(context.Context, string)) defaultSchedulerHandlers {
+	if source == nil {
+		fail := func(context.Context, Services) error { return fmt.Errorf("project catalog is not configured") }
+		return defaultSchedulerHandlers{tick: fail, claim: fail}
+	}
+	claimMu := &sync.Mutex{}
+	notificationGateways := newSchedulerNotificationGatewayFactory()
+	coordinatorState := coordinatorrole.NewRuntimeState()
+	followUpSweeps := reviewer.NewFollowUpSweepState()
+	// Trusted review proxies are minted per reviewer agent run (bound to that
+	// run's PR). Catalog snapshots reuse claim serialization and notification
+	// transport continuity while retaining config-specific policy.
+	buildSnapshot := func() defaultSchedulerHandlers {
+		cfg := source.Snapshot()
+		return buildDefaultSchedulerHandlersWithOptions(cfg, configPath, logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, false, claimMu, nil, notificationGateways, coordinatorState, followUpSweeps)
+	}
+	handlers := defaultSchedulerHandlers{
+		snapshot:             buildSnapshot,
+		notificationGateways: notificationGateways,
+	}
+	if coordinator != nil && repos != nil {
+		handlers.webhook = webhookforward.New(webhookforward.Options{
+			Repos:        repos,
+			Config:       source.Snapshot(),
+			ConfigSource: source,
+			Reviewer: catalogWebhookReviewer{snapshot: func() reviewerScheduler {
+				return handlers.snapshot().reviewer
+			}},
+			Fixer: catalogWebhookFixer{snapshot: func() fixerScheduler {
+				return handlers.snapshot().fixer
+			}},
+			DiscoverProject: func(ctx context.Context, request webhookforward.ProjectDiscovery) error {
+				input := handlers.snapshot().input(Services{Repositories: repos, Coordinator: coordinator})
+				return discoverWebhookProject(ctx, input, request)
+			},
+			Logger: logger,
+			Now:    now,
+			// Accept-time gate only: once Forward returns accepted/202 the
+			// delivery is committed and workers complete discovery even if
+			// admission later degrades. BeginShutdown/Stop aborts via CancelExecute.
+			AllowExecute: allowClaim,
+			// Hold admission across accept+enqueue so MarkDegraded cannot
+			// flip closed mid-section before the accepted-delivery record.
+			AllowExecuteWhile: withAllowClaim,
+		})
+	}
+	attachClaimGate := func(input defaultSchedulerTickInput, services Services) defaultSchedulerTickInput {
+		input.ClaimBoundary = claimBoundary
+		input.AllowClaim = allowClaim
+		// Runtime-owned cancelable lifecycle for post-claim human-attention
+		// delivery (BeginShutdown cancel + Stop drain). Overrides the snapshot
+		// default which would run under the detached WithoutCancel dispatch ctx.
+		if notifyHumanAttention != nil {
+			input.NotifyHumanAttention = notifyHumanAttention
+		}
+		// Wire Supervisor operation leases for claim ownership span (#579).
+		// Prefer the live registry from Services when present (daemon path).
+		if services.ActiveExecutions != nil {
+			input.OperationOwner = services.ActiveExecutions
+		} else if activeExecutions != nil {
+			input.OperationOwner = activeExecutions
+		}
+		input.RefreshForClaim = func() defaultSchedulerTickInput {
+			latestSnapshot := handlers.snapshot()
+			if latestSnapshot.input == nil {
+				stopped := input
+				stopped.MaxConcurrentRuns = 0
+				stopped.RefreshForClaim = nil
+				stopped.AllowClaim = allowClaim
+				if notifyHumanAttention != nil {
+					stopped.NotifyHumanAttention = notifyHumanAttention
+				}
+				if services.ActiveExecutions != nil {
+					stopped.OperationOwner = services.ActiveExecutions
+				} else if activeExecutions != nil {
+					stopped.OperationOwner = activeExecutions
+				}
+				return stopped
+			}
+			latest := latestSnapshot.input(services)
+			latest.ClaimBoundary = claimBoundary
+			latest.AllowClaim = allowClaim
+			if notifyHumanAttention != nil {
+				latest.NotifyHumanAttention = notifyHumanAttention
+			}
+			if services.ActiveExecutions != nil {
+				latest.OperationOwner = services.ActiveExecutions
+			} else if activeExecutions != nil {
+				latest.OperationOwner = activeExecutions
+			}
+			return latest
+		}
+		return input
+	}
+	handlers.tick = func(ctx context.Context, services Services) error {
+		snapshot := handlers.snapshot()
+		if snapshot.input == nil {
+			return snapshot.tick(ctx, services)
+		}
+		return runDefaultSchedulerTick(ctx, attachClaimGate(snapshot.input(services), services))
+	}
+	handlers.claim = func(ctx context.Context, services Services) error {
+		snapshot := handlers.snapshot()
+		if snapshot.input == nil {
+			return snapshot.claim(ctx, services)
+		}
+		return runIndependentClaimPass(ctx, attachClaimGate(snapshot.input(services), services))
+	}
+	return handlers
+}
+
 func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error)) defaultSchedulerHandlers {
+	return buildDefaultSchedulerHandlersWithOptions(cfg, "", logger, coordinator, repos, gitGateway, githubGateway, activeExecutions, asyncRunner, requestWake, now, reconcileStaleRuns, true, nil, nil, newSchedulerNotificationGatewayFactory(), coordinatorrole.NewRuntimeState(), reviewer.NewFollowUpSweepState())
+}
+
+func buildDefaultSchedulerHandlersWithOptions(cfg config.Config, configPath string, logger bootstrap.Logger, coordinator *storage.SQLiteCoordinator, repos *storage.Repositories, gitGateway *gitinfra.Gateway, githubGateway *githubinfra.Gateway, activeExecutions *ActiveExecutionRegistry, asyncRunner func() schedulerAsyncRunner, requestWake func(), now func() time.Time, reconcileStaleRuns func(context.Context) (StaleRunReconcileSummary, error), includeWebhook bool, claimMu *sync.Mutex, configSource projects.ConfigSource, notificationGateways *schedulerNotificationGatewayFactory, coordinatorState *coordinatorrole.RuntimeState, followUpSweeps *reviewer.FollowUpSweepState) defaultSchedulerHandlers {
 	if now == nil {
 		now = time.Now
 	}
@@ -1667,17 +3403,36 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 		}
 		return defaultSchedulerHandlers{tick: fail, claim: fail}
 	}
-	if cfg.Agent.Vendor == nil {
-		noop := func(context.Context, Services) error { return nil }
-		return defaultSchedulerHandlers{tick: noop, claim: noop}
-	}
-	notificationGateway := notify.NewGateway(notify.Options{
+	// Always build coding-role runners, even when live ResolveAgent fails.
+	// Sticky retries of failed/interrupted runs copy runs.agent_snapshot_json and
+	// execute via UseSnapshot; omitting runners strands those queue items after
+	// vendor removal. Fresh work for unconfigured roles is still not claimed —
+	// claimTypeSetsFromInput puts those types in stickySnapshotOnly so only
+	// loops with a valid predecessor snapshot are eligible. New discovery stays
+	// gated on CodingRoleAgentConfigured via *DiscoveryEnabled flags and
+	// webhook nil-runner checks.
+	notificationGateway := notificationGateways.New(notify.Options{
 		Config:        cfg.Notifications,
 		OsascriptPath: derefString(cfg.Tools.OsascriptPath),
-		LogFilePath:   filepath.Join(cfg.Daemon.LogDir, "looperd.log"),
 		Repositories:  repos,
 		Now:           now,
 	})
+	notifyHumanAttention := func(ctx context.Context, loopID string) {
+		notifyDurableHumanAttention(ctx, notificationGateway, repos, loopID)
+	}
+	// refreshFeishuAnchor re-renders a loop's thread-anchor card to reflect its
+	// CURRENT status (colour + label), without disturbing the retained live tail.
+	// The anchor is otherwise only patched opportunistically by the progress ticker
+	// (OnProgress) while an agent runs — so a loop that finishes quickly, or leaves
+	// awaiting_human on resume, would leave a stale "🔧 处理中 / ⏸ 等你定夺" header
+	// forever. Calling this on every run start/finish makes the header converge to
+	// the real status. App-mode only; a no-op otherwise.
+	refreshFeishuAnchor := func(ctx context.Context, loopID string) {
+		if strings.TrimSpace(loopID) == "" || !strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+			return
+		}
+		notificationGateway.RefreshThreadHeader(ctx, loopID, nil, 0)
+	}
 	notifyAgentExecutionStarted := func(ctx context.Context, input agentExecutionNotificationInput) error {
 		notificationGateway.Notify(ctx, notify.SystemNotificationPayload{
 			ID:         input.ExecutionID,
@@ -1692,10 +3447,25 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			EntityID:   input.ExecutionID,
 			DedupeKey:  input.DedupeKey,
 		})
+		refreshFeishuAnchor(ctx, input.LoopID)
 		return nil
 	}
 	notifyWorkerRunCompleted := func(ctx context.Context, input workerRunCompletedNotificationInput) error {
 		workerNotificationKeyID := runtimeFirstNonEmpty(input.RunID, input.LoopID)
+		// Hard holds are owned by the central human-attention path after claim
+		// finalization and lease release (runOwnedQueueClaims post-observer).
+		// Do not notify here: OnRunCompleted still holds the operation lease and
+		// the loop is still running, so a slow local or remote notifier would
+		// hold a concurrency slot before the durable pause.
+		// Still record the Feishu milestone / refresh below.
+		if input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention {
+			if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "⏸ 需要人处理")
+			} else {
+				refreshFeishuAnchor(ctx, input.LoopID)
+			}
+			return nil
+		}
 		payload := notify.SystemNotificationPayload{
 			ProjectID:  input.ProjectID,
 			LoopID:     input.LoopID,
@@ -1705,11 +3475,6 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			EntityID:   input.RunID,
 		}
 		switch {
-		case input.Status == "failed" && input.FailureKind == worker.FailureManualIntervention:
-			payload.Level = "action_required"
-			payload.Title = "Looper Worker Needs Attention"
-			payload.Body = input.Summary
-			payload.DedupeKey = fmt.Sprintf("runtime.worker.action_required:%s", workerNotificationKeyID)
 		case input.Status == "failed":
 			payload.Level = "failure"
 			payload.Title = "Looper Worker Failed"
@@ -1732,6 +3497,24 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 			payload.DedupeKey = fmt.Sprintf("runtime.worker.completed:%s", input.RunID)
 		}
 		notificationGateway.Notify(ctx, payload)
+		// Log the outcome to the loop's story so the anchor reads as a narrative.
+		if strings.TrimSpace(input.LoopID) != "" && strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+			switch {
+			case input.PullRequestNumber > 0:
+				link := runtimeFirstNonEmpty(input.PullRequestURL, "")
+				if link != "" {
+					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 [PR #%d](%s)", input.PullRequestNumber, link))
+				} else {
+					notificationGateway.RecordMilestone(ctx, input.LoopID, fmt.Sprintf("🔀 已开 PR #%d", input.PullRequestNumber))
+				}
+			case input.Status == "failed":
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "⚠️ 本轮失败,重试中")
+			case input.Status != "skipped":
+				notificationGateway.RecordMilestone(ctx, input.LoopID, "✅ 完成")
+			}
+		} else {
+			refreshFeishuAnchor(ctx, input.LoopID)
+		}
 		return nil
 	}
 
@@ -1741,218 +3524,440 @@ func buildDefaultSchedulerHandlers(cfg config.Config, logger bootstrap.Logger, c
 	var fixerRunner fixerScheduler
 	var workerRunner workerScheduler
 
-	agentExecutor := agent.New(agent.ExecutorOptions{
-		Config: agent.ExecutorConfig{
-			Vendor:              *cfg.Agent.Vendor,
-			Model:               cfg.Agent.Model,
-			Params:              cfg.Agent.Params,
-			Env:                 cfg.Agent.Env,
-			NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
-		},
-		Repos:  repos,
-		LogDir: cfg.Daemon.LogDir,
-		Now:    now,
-	})
-	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
-	stamper := disclosure.FromConfig(cfg)
-	agentRuntime := ""
-	if cfg.Agent.Vendor != nil {
-		agentRuntime = string(*cfg.Agent.Vendor)
+	looperCLIPath := resolveTrustedLooperCLIPath(cfg)
+	// Keep LOOPER_TRUSTED_REVIEW_SOCK out of shared agent executor env so
+	// planner/worker/fixer cannot publish reviews. Inject only via the
+	// reviewer adapter, which mints a per-run proxy bound to the selected PR.
+	// Env-gated (not a config field yet) so it stays zero-risk to the schema
+	// / parity fixtures until the codex --json path is proven end-to-end.
+	liveToolEvents := strings.EqualFold(strings.TrimSpace(os.Getenv("LOOPER_CODEX_JSON_EVENTS")), "1")
+	// Live progress → Feishu anchor card. Vendor-agnostic (works off the agent
+	// subprocess's stdout tail). Only wired when the Feishu app-bot transport is
+	// configured; a no-op otherwise.
+	onAgentProgress := func(ctx context.Context, p agent.ProgressUpdate) {
+		if p.LoopID == "" || !strings.EqualFold(strings.TrimSpace(cfg.Notifications.Webhook.Mode), "app") {
+			return
+		}
+		// In-memory only — never writes the loop record, so it can't race the
+		// scheduler's loop/run writes.
+		notificationGateway.RefreshThreadHeader(ctx, p.LoopID, p.TailLines, p.ElapsedSeconds)
 	}
-	plannerRunner = planner.New(planner.Options{
-		DB:                 coordinator.DB(),
-		Repos:              repos,
-		GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		Git:                plannerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:      plannerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:             logger,
-		Now:                now,
-		AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
-		Disclosure:         &cfg.Disclosure,
-		AgentRuntime:       agentRuntime,
-		CustomInstructions: &cfg,
-		AgentModel:         cfg.Agent.Model,
-		AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
-		DiscoveryPolicy: planner.DiscoveryPolicy{
-			AutoDiscovery:              cfg.Roles.Planner.AutoDiscovery,
-			Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),
-			LabelMode:                  cfg.Roles.Planner.Triggers.LabelMode,
-			RequireAssigneeCurrentUser: cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser,
-		},
-		RetryBaseDelay:      retryBaseDelay,
-		RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-		OnQueueItemEnqueued: requestWake,
-		OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
-			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
-		},
-	})
-	coordinatorRunner = coordinatorrole.New(coordinatorrole.Options{
+	// Hard observation write failures degrade sticky admission (#578).
+	onHardPersistFailure := func(err error) {
+		if activeExecutions != nil {
+			activeExecutions.ReportHardPersistFailure(err)
+		}
+	}
+	newRoleAgentExecutor := func(resolved config.ResolvedAgent, nono *config.ReviewerNonoConfig) *agent.ConfiguredExecutor {
+		// agent.params (especially command/args) belong to the global agent
+		// vendor. Keep the unstripped map and the owner vendor on the executor
+		// so effectiveConfig can filter against the effective identity: live
+		// role claims strip cross-vendor wrappers, while sticky snapshot
+		// retries that restore the owner vendor keep command/args (resolveCommand
+		// prefers params.command over vendor defaults).
+		return agent.New(agent.ExecutorOptions{
+			HostingConfig: &cfg, TrustedLooperPath: looperCLIPath, HostingTracker: activeExecutions,
+			Nono: nono,
+			Config: agent.ExecutorConfig{
+				Vendor:              resolved.Vendor,
+				Model:               resolved.Model,
+				Params:              cfg.Agent.Params,
+				Env:                 cfg.Agent.Env,
+				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
+				LiveToolEvents:      liveToolEvents,
+			},
+			ParamsOwnerVendor: cfg.Agent.Vendor,
+			Repos:             repos,
+			LogDir:            cfg.Daemon.LogDir,
+			Now:               now,
+			// Common executor boundary ownership for every in-scope agent role
+			// (planner/reviewer/fixer/worker/coordinator) — not post-spawn adapters (#576).
+			Owner:                activeExecutions,
+			OnHardPersistFailure: onHardPersistFailure,
+			OnProgress:           onAgentProgress,
+		})
+	}
+	retryBaseDelay := time.Duration(cfg.Scheduler.RetryBaseDelayMS) * time.Millisecond
+	roleStamper := func(resolved config.ResolvedAgent) disclosure.Stamper {
+		model := ""
+		if resolved.Model != nil {
+			model = *resolved.Model
+		}
+		return disclosure.Stamper{
+			Config:  cfg.Disclosure,
+			Version: version.Current().Version,
+			Agent:   string(resolved.Vendor),
+			Model:   model,
+		}
+	}
+
+	// Construct even when live config no longer resolves so sticky snapshot retries remain claimable.
+	resolvedPlanner, plannerConfigured := config.ResolveAgent(cfg, "", config.CodingRolePlanner)
+	{
+		resolved := resolvedPlanner
+		plannerExecutor := newRoleAgentExecutor(resolved, nil)
+		var agentModel *string
+		if resolved.Model != nil {
+			model := *resolved.Model
+			agentModel = &model
+		}
+		plannerStamper := roleStamper(resolved)
+		plannerAutoDiscovery := cfg.Roles.Planner.AutoDiscovery
+		if !plannerConfigured {
+			plannerAutoDiscovery = false
+		}
+		plannerRunner = planner.New(planner.Options{
+			DB:                 coordinator.DB(),
+			Repos:              repos,
+			GitHub:             plannerGitHubAdapter{gateway: githubGateway, stamper: plannerStamper, config: &cfg},
+			Git:                plannerGitAdapter{gateway: gitGateway, stamper: plannerStamper},
+			AgentExecutor:      plannerAgentExecutorAdapter{executor: plannerExecutor},
+			Logger:             logger,
+			Now:                now,
+			AllowAutoPush:      boolPtr(cfg.Defaults.AllowAutoPush),
+			Disclosure:         &cfg.Disclosure,
+			AgentRuntime:       string(resolved.Vendor),
+			AgentProfileID:     resolved.ProfileID,
+			CustomInstructions: &cfg,
+			AgentModel:         agentModel,
+			AgentTimeout:       time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:   time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds) * time.Second,
+			DiscoveryPolicy: planner.DiscoveryPolicy{
+				AutoDiscovery:              plannerAutoDiscovery,
+				Labels:                     append([]string(nil), cfg.Roles.Planner.Triggers.Labels...),
+				LabelMode:                  cfg.Roles.Planner.Triggers.LabelMode,
+				RequireAssigneeCurrentUser: cfg.Roles.Planner.Triggers.RequireAssigneeCurrentUser,
+			},
+			RetryBaseDelay:      retryBaseDelay,
+			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued: requestWake,
+			OnAgentExecutionStarted: func(ctx context.Context, input planner.AgentExecutionStartedInput) error {
+				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Planner", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+			},
+		})
+	}
+
+	// Coordinator triage LLM uses the global agent only; missing global vendor
+	// must not disable coding roles that resolve via role/profile bindings.
+	coordinatorOpts := coordinatorrole.Options{
 		Repos:   repos,
 		GitHub:  githubGateway,
 		Config:  &cfg,
 		Logger:  logger,
 		Now:     now,
+		State:   coordinatorState,
 		Network: coordinatorrole.NewLoopernetGateway(networkclient.DefaultStatePath(runtimeHomeDirOrEmpty())),
-		TriageLLM: coordinatorrole.NewAgentLLM(agentExecutor, now,
+	}
+	if cfg.Agent.Vendor != nil {
+		// Same ParamsOwnerVendor as coding-role executors: agent.params.command/args
+		// are owned by global agent.vendor. Without this, effectiveConfig's
+		// ParamsForRoleVendor nil-owner path strips wrappers and coordinator
+		// triage launches bare vendor defaults while role executors keep them.
+		globalExecutor := agent.New(agent.ExecutorOptions{
+			HostingConfig: &cfg, TrustedLooperPath: looperCLIPath, HostingTracker: activeExecutions,
+			Config: agent.ExecutorConfig{
+				Vendor:              *cfg.Agent.Vendor,
+				Model:               cfg.Agent.Model,
+				Params:              cfg.Agent.Params,
+				Env:                 cfg.Agent.Env,
+				NativeResumeEnabled: cfg.Agent.NativeResume.Enabled,
+				LiveToolEvents:      liveToolEvents,
+			},
+			ParamsOwnerVendor:    cfg.Agent.Vendor,
+			Repos:                repos,
+			LogDir:               cfg.Daemon.LogDir,
+			Now:                  now,
+			Owner:                activeExecutions,
+			OnHardPersistFailure: onHardPersistFailure,
+			OnProgress:           onAgentProgress,
+		})
+		coordinatorOpts.TriageLLM = coordinatorrole.NewAgentLLM(globalExecutor, now,
 			time.Duration(cfg.Agent.Timeouts.PlannerMaxRuntimeSeconds)*time.Second,
 			time.Duration(cfg.Agent.Timeouts.PlannerIdleTimeoutSeconds)*time.Second,
-		),
-	})
-	reviewerRunner = reviewer.New(reviewer.Options{
-		DB:               coordinator.DB(),
-		Repos:            repos,
-		GitHub:           reviewerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		Git:              reviewerGitAdapter{gateway: gitGateway},
-		AgentExecutor:    reviewerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:           logger,
-		Now:              now,
-		AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
-		ReviewEvents:     cfg.Roles.Reviewer.Behavior.ReviewEvents,
-		LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
-		DiscoveryPolicy: reviewer.DiscoveryPolicy{
-			AutoDiscovery:             cfg.Roles.Reviewer.Discovery.AutoDiscovery,
-			IncludeDrafts:             cfg.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
-			RequireReviewRequest:      cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
-			EnableSelfReview:          cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
-			Labels:                    append([]string(nil), cfg.Roles.Reviewer.Discovery.Triggers.Labels...),
-			LabelMode:                 cfg.Roles.Reviewer.Discovery.Triggers.LabelMode,
-			IncludeSpecReviewingLabel: cfg.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel,
-			SpecReviewingLabel:        cfg.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel,
-		},
-		Scope:                   cfg.Roles.Reviewer.Behavior.Scope,
-		DetectDuplicateFindings: cfg.Roles.Reviewer.Behavior.DetectDuplicateFindings,
-		NativeResume:            cfg.Roles.Reviewer.Behavior.NativeResume,
-		ThreadResolution:        cfg.Roles.Reviewer.Behavior.ThreadResolution,
-		Disclosure:              &cfg.Disclosure,
-		AgentRuntime:            agentRuntime,
-		CustomInstructions:      &cfg,
-		LooperCLIPath:           derefString(cfg.Tools.LooperPath),
-		AgentModel:              cfg.Agent.Model,
-		AgentTimeout:            time.Duration(cfg.Agent.Timeouts.ReviewerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:        time.Duration(cfg.Agent.Timeouts.ReviewerIdleTimeoutSeconds) * time.Second,
-		RetryBaseDelay:          retryBaseDelay,
-		RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
-		RetryPolicy:             cfg.Roles.Reviewer.Behavior.Retry,
-		OnQueueItemEnqueued:     requestWake,
-		OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
-			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
-		},
-	})
-	fixerRunner = fixer.New(fixer.Options{
-		DB:                 coordinator.DB(),
-		Repos:              repos,
-		GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		Git:                fixerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:      fixerAgentExecutorAdapter{executor: agentExecutor},
-		Logger:             logger,
-		Now:                now,
-		AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
-		AllowAutoPush:      cfg.Defaults.AllowAutoPush,
-		AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
-		FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
-		DiscoveryPolicy: fixer.DiscoveryPolicy{
-			AutoDiscovery: cfg.Roles.Fixer.AutoDiscovery,
-			IncludeDrafts: cfg.Roles.Fixer.Triggers.IncludeDrafts,
-			AuthorFilter:  cfg.Roles.Fixer.Triggers.AuthorFilter,
-			Labels:        append([]string(nil), cfg.Roles.Fixer.Triggers.Labels...),
-			LabelMode:     cfg.Roles.Fixer.Triggers.LabelMode,
-		},
-		Disclosure:          &cfg.Disclosure,
-		AgentRuntime:        agentRuntime,
-		CustomInstructions:  &cfg,
-		AgentModel:          cfg.Agent.Model,
-		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
-		RetryBaseDelay:      retryBaseDelay,
-		RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-		OnQueueItemEnqueued: requestWake,
-		OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
-			return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
-		},
-	})
-	workerRunner = worker.New(worker.Options{
-		DB:     coordinator.DB(),
-		Repos:  repos,
-		GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: stamper, config: &cfg},
-		GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
-			return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
-		},
-		Git:             workerGitAdapter{gateway: gitGateway, stamper: stamper},
-		AgentExecutor:   workerAgentExecutorAdapter{executor: agentExecutor, registry: activeExecutions},
-		Logger:          logger,
-		Now:             now,
-		AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
-		AllowAutoPush:   cfg.Defaults.AllowAutoPush,
-		OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
-		DiscoveryPolicy: worker.DiscoveryPolicy{
-			AutoDiscovery:              cfg.Roles.Worker.AutoDiscovery,
-			Labels:                     append([]string(nil), cfg.Roles.Worker.Triggers.Labels...),
-			LabelMode:                  cfg.Roles.Worker.Triggers.LabelMode,
-			RequireAssigneeCurrentUser: cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser,
-		},
-		Disclosure:          &cfg.Disclosure,
-		AgentRuntime:        agentRuntime,
-		CustomInstructions:  &cfg,
-		Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
-		AgentModel:          cfg.Agent.Model,
-		AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
-		AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
-		RetryBaseDelay:      retryBaseDelay,
-		RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
-		OnQueueItemEnqueued: requestWake,
-		OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
-			return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
-		},
-	})
-	claimMu := &sync.Mutex{}
+		)
+	} else if logger != nil {
+		logger.Warn("coordinator triage LLM skipped: global agent.vendor is not configured", nil)
+	}
+	coordinatorRunner = coordinatorrole.New(coordinatorOpts)
+
+	resolvedReviewer, reviewerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleReviewer)
+	{
+		resolved := resolvedReviewer
+		reviewerExecutor := newRoleAgentExecutor(resolved, cfg.Roles.Reviewer.Nono)
+		var agentModel *string
+		if resolved.Model != nil {
+			model := *resolved.Model
+			agentModel = &model
+		}
+		reviewerStamper := roleStamper(resolved)
+		reviewerAutoDiscovery := cfg.Roles.Reviewer.Discovery.AutoDiscovery
+		if !reviewerConfigured {
+			reviewerAutoDiscovery = false
+		}
+		reviewerRunner = reviewer.New(reviewer.Options{
+			DB:     coordinator.DB(),
+			Repos:  repos,
+			GitHub: reviewerGitHubAdapter{gateway: githubGateway, stamper: reviewerStamper, config: &cfg},
+			Git:    reviewerGitAdapter{gateway: gitGateway, localDiff: githubinfra.New(githubinfra.Options{GitPath: derefString(cfg.Tools.GitPath)})},
+			AgentExecutor: reviewerAgentExecutorAdapter{
+				executor:    reviewerExecutor,
+				realLooper:  looperCLIPath,
+				trustedEnv:  trustedReviewChildEnv(cfg),
+				config:      &cfg,
+				agentVendor: resolved.Vendor,
+				agentModel:  agentModel,
+				tracker:     activeExecutions,
+			},
+			Logger:           logger,
+			Now:              now,
+			AllowAutoApprove: cfg.Defaults.AllowAutoApprove,
+			ReviewEvents:     cfg.Roles.Reviewer.Behavior.ReviewEvents,
+			LoopConfig:       cfg.Roles.Reviewer.Behavior.Loop,
+			DiscoveryPolicy: reviewer.DiscoveryPolicy{
+				AutoDiscovery:             reviewerAutoDiscovery,
+				IncludeDrafts:             cfg.Roles.Reviewer.Discovery.Triggers.IncludeDrafts,
+				RequireReviewRequest:      cfg.Roles.Reviewer.Discovery.Triggers.RequireReviewRequest,
+				EnableSelfReview:          cfg.Roles.Reviewer.Discovery.Triggers.EnableSelfReview,
+				Labels:                    append([]string(nil), cfg.Roles.Reviewer.Discovery.Triggers.Labels...),
+				LabelMode:                 cfg.Roles.Reviewer.Discovery.Triggers.LabelMode,
+				IncludeSpecReviewingLabel: cfg.Roles.Reviewer.Discovery.SpecReview.IncludeReviewingLabel,
+				SpecReviewingLabel:        cfg.Roles.Reviewer.Discovery.SpecReview.ReviewingLabel,
+			},
+			Scope:                   cfg.Roles.Reviewer.Behavior.Scope,
+			DetectDuplicateFindings: cfg.Roles.Reviewer.Behavior.DetectDuplicateFindings,
+			NativeResume:            cfg.Roles.Reviewer.Behavior.NativeResume,
+			ThreadResolution:        cfg.Roles.Reviewer.Behavior.ThreadResolution,
+			Disclosure:              &cfg.Disclosure,
+			AgentRuntime:            string(resolved.Vendor),
+			AgentProfileID:          resolved.ProfileID,
+			CustomInstructions:      &cfg,
+			LooperCLIPath:           looperCLIPath,
+			AgentModel:              agentModel,
+			AgentTimeout:            time.Duration(cfg.Agent.Timeouts.ReviewerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:        time.Duration(cfg.Agent.Timeouts.ReviewerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:          retryBaseDelay,
+			RetryMaxAttempts:        int64(cfg.Scheduler.RetryMaxAttempts),
+			RetryPolicy:             cfg.Roles.Reviewer.Behavior.Retry,
+			OnQueueItemEnqueued:     requestWake,
+			NotifyHumanAttention:    notifyHumanAttention,
+			FollowUpSweeps:          followUpSweeps,
+			OnAgentExecutionStarted: func(ctx context.Context, input reviewer.AgentExecutionStartedInput) error {
+				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Reviewer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+			},
+		})
+	}
+	resolvedFixer, fixerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleFixer)
+	{
+		resolved := resolvedFixer
+		fixerExecutor := newRoleAgentExecutor(resolved, nil)
+		var agentModel *string
+		if resolved.Model != nil {
+			model := *resolved.Model
+			agentModel = &model
+		}
+		fixerStamper := roleStamper(resolved)
+		fixerAutoDiscovery := cfg.Roles.Fixer.AutoDiscovery
+		if !fixerConfigured {
+			fixerAutoDiscovery = false
+		}
+		fixerRunner = fixer.New(fixer.Options{
+			DB:                 coordinator.DB(),
+			Repos:              repos,
+			GitHub:             fixerGitHubAdapter{gateway: githubGateway, stamper: fixerStamper, config: &cfg},
+			Git:                fixerGitAdapter{gateway: gitGateway, stamper: fixerStamper},
+			AgentExecutor:      fixerAgentExecutorAdapter{executor: fixerExecutor},
+			Logger:             logger,
+			Now:                now,
+			AllowAutoCommit:    cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:      cfg.Defaults.AllowAutoPush,
+			AllowRiskyFixes:    cfg.Defaults.AllowRiskyFixes,
+			HITLEnabled:        cfg.HITL.Enabled,
+			FixAllPullRequests: cfg.Defaults.FixAllPullRequests,
+			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
+			ContainmentTracker: activeExecutions,
+			DiscoveryPolicy: fixer.DiscoveryPolicy{
+				AutoDiscovery: fixerAutoDiscovery,
+				IncludeDrafts: cfg.Roles.Fixer.Triggers.IncludeDrafts,
+				AuthorFilter:  cfg.Roles.Fixer.Triggers.AuthorFilter,
+				Labels:        append([]string(nil), cfg.Roles.Fixer.Triggers.Labels...),
+				LabelMode:     cfg.Roles.Fixer.Triggers.LabelMode,
+			},
+			Disclosure:           &cfg.Disclosure,
+			AgentRuntime:         string(resolved.Vendor),
+			AgentProfileID:       resolved.ProfileID,
+			CustomInstructions:   &cfg,
+			AgentModel:           agentModel,
+			AgentTimeout:         time.Duration(cfg.Agent.Timeouts.FixerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:     time.Duration(cfg.Agent.Timeouts.FixerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:       retryBaseDelay,
+			RetryMaxAttempts:     int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued:  requestWake,
+			NotifyHumanAttention: notifyHumanAttention,
+			OnAgentExecutionStarted: func(ctx context.Context, input fixer.AgentExecutionStartedInput) error {
+				return notifyAgentExecutionStarted(ctx, agentExecutionNotificationInput{ExecutionID: input.ExecutionID, ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Title: "Looper Fixer", Subtitle: input.Subtitle, Body: input.Body, DedupeKey: input.DedupeKey})
+			},
+		})
+	}
+	notifyHITLAsk := func(ctx context.Context, ask worker.HITLAskNotification) error {
+		return notificationGateway.SendHITLAsk(ctx, notify.HITLAskCard{
+			ProjectID: ask.ProjectID, LoopID: ask.LoopID, LoopSeq: ask.LoopSeq,
+			Repo: ask.Repo, Title: ask.Title, Question: ask.Question, Options: ask.Options,
+			SourceType: ask.SourceType, SourceRef: ask.SourceRef, SourceURL: ask.SourceURL,
+			TriggerLogin:      ask.TriggerLogin,
+			Recommendation:    ask.Recommendation,
+			RecommendedOption: ask.RecommendedOption,
+			Consequences:      ask.Consequences,
+			Confidence:        ask.Confidence,
+		})
+	}
+	resolvedWorker, workerConfigured := config.ResolveAgent(cfg, "", config.CodingRoleWorker)
+	{
+		resolved := resolvedWorker
+		workerExecutor := newRoleAgentExecutor(resolved, nil)
+		var agentModel *string
+		if resolved.Model != nil {
+			model := *resolved.Model
+			agentModel = &model
+		}
+		workerStamper := roleStamper(resolved)
+		workerAutoDiscovery := cfg.Roles.Worker.AutoDiscovery
+		if !workerConfigured {
+			workerAutoDiscovery = false
+		}
+		workerRunner = worker.New(worker.Options{
+			DB:     coordinator.DB(),
+			Repos:  repos,
+			GitHub: workerGitHubAdapter{gateway: githubGateway, stamper: workerStamper, config: &cfg},
+			GitHubCLIAutoPROpeningAvailable: func(ctx context.Context, repo, cwd string) bool {
+				return githubCLIAutoPROpeningAvailable(ctx, cfg, githubGateway, logger, repo, cwd)
+			},
+			Git:             workerGitAdapter{gateway: gitGateway, stamper: workerStamper},
+			AgentExecutor:   workerAgentExecutorAdapter{executor: workerExecutor},
+			Logger:          logger,
+			Now:             now,
+			AllowAutoCommit: cfg.Defaults.AllowAutoCommit,
+			AllowAutoPush:   cfg.Defaults.AllowAutoPush,
+			OpenPRStrategy:  cfg.Defaults.OpenPRStrategy,
+			// Validation shell is Supervisor-owned (#577): track handles for retain-storage.
+			ContainmentTracker: activeExecutions,
+			DiscoveryPolicy: worker.DiscoveryPolicy{
+				AutoDiscovery:              workerAutoDiscovery,
+				Labels:                     append([]string(nil), cfg.Roles.Worker.Triggers.Labels...),
+				LabelMode:                  cfg.Roles.Worker.Triggers.LabelMode,
+				RequireAssigneeCurrentUser: cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser,
+			},
+			Disclosure:          &cfg.Disclosure,
+			AgentRuntime:        string(resolved.Vendor),
+			AgentProfileID:      resolved.ProfileID,
+			CustomInstructions:  &cfg,
+			Network:             coordinatorNetworkGateway{statePath: networkclient.DefaultStatePath(runtimeHomeDirOrEmpty()), client: &http.Client{Timeout: 10 * time.Second}},
+			AgentModel:          agentModel,
+			AgentTimeout:        time.Duration(cfg.Agent.Timeouts.WorkerMaxRuntimeSeconds) * time.Second,
+			AgentIdleTimeout:    time.Duration(cfg.Agent.Timeouts.WorkerIdleTimeoutSeconds) * time.Second,
+			RetryBaseDelay:      retryBaseDelay,
+			RetryMaxAttempts:    int64(cfg.Scheduler.RetryMaxAttempts),
+			OnQueueItemEnqueued: requestWake,
+			OnRunCompleted: func(ctx context.Context, input worker.RunCompletedInput) error {
+				return notifyWorkerRunCompleted(ctx, workerRunCompletedNotificationInput{ProjectID: input.ProjectID, LoopID: input.LoopID, RunID: input.RunID, Subtitle: input.Subtitle, Status: input.Status, Summary: input.Summary, FailureKind: input.FailureKind, PullRequestNumber: input.PullRequestNumber, PullRequestURL: input.PullRequestURL})
+			},
+			HITLEnabled:         cfg.HITL.Enabled,
+			HITLAnswerTransport: cfg.HITL.AnswerTransport,
+			HITLGitHub:          hitlGitHubSettings(cfg.HITL.GitHub),
+			HITLNotify:          notifyHITLAsk,
+		})
+	}
+	if claimMu == nil {
+		claimMu = &sync.Mutex{}
+	}
 
 	inputForServices := func(services Services) defaultSchedulerTickInput {
 		var runner schedulerAsyncRunner
 		if asyncRunner != nil {
 			runner = asyncRunner()
 		}
+		// Avoid typed-nil interface: (*githubinfra.Gateway)(nil) assigned to
+		// snapshotScheduler is a non-nil interface value and would enable snapshot claims.
+		var snapshotter snapshotScheduler
+		if githubGateway != nil {
+			snapshotter = githubGateway
+		}
+		var tickDB *sql.DB
+		if services.Coordinator != nil {
+			tickDB = services.Coordinator.DB()
+		}
 		return defaultSchedulerTickInput{
-			Repos:                    services.Repositories,
-			GitHubGateway:            githubGateway,
-			Logger:                   logger,
-			Now:                      now,
-			MaxConcurrentRuns:        cfg.Scheduler.MaxConcurrentRuns,
-			ClaimMu:                  claimMu,
-			ReconcileStaleRuns:       reconcileStaleRuns,
-			AsyncRunner:              runner,
-			RequestSchedulerWake:     requestWake,
-			Planner:                  plannerRunner,
-			Coordinator:              coordinatorRunner,
-			Reviewer:                 reviewerRunner,
-			Fixer:                    fixerRunner,
-			Worker:                   workerRunner,
-			Snapshotter:              githubGateway,
-			Config:                   &cfg,
-			PlannerDiscoveryEnabled:  boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
+			Repos:                services.Repositories,
+			DB:                   tickDB,
+			GitHubGateway:        githubGateway,
+			Logger:               logger,
+			Now:                  now,
+			MaxConcurrentRuns:    cfg.Scheduler.MaxConcurrentRuns,
+			ClaimMu:              claimMu,
+			ReconcileStaleRuns:   reconcileStaleRuns,
+			AsyncRunner:          runner,
+			RequestSchedulerWake: requestWake,
+			Planner:              plannerRunner,
+			Coordinator:          coordinatorRunner,
+			Reviewer:             reviewerRunner,
+			Fixer:                fixerRunner,
+			Worker:               workerRunner,
+			Snapshotter:          snapshotter,
+			Config:               &cfg,
+			// Live discovery requires a currently resolvable agent; sticky retries
+			// still claim via always-present runners when vendor was removed
+			// (claimTypeSetsFromInput restricts unconfigured roles to snapshot items).
+			PlannerDiscoveryEnabled:  boolPtr(plannerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "planner")),
 			CoordinatorEnabled:       func(projectID string) bool { return config.ProjectRoleConfigs(cfg, projectID).Coordinator.Enabled },
-			ReviewerDiscoveryEnabled: boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
-			FixerDiscoveryEnabled:    boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
-			WorkerDiscoveryEnabled:   boolPtr(config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			ReviewerDiscoveryEnabled: boolPtr(reviewerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "reviewer")),
+			FixerDiscoveryEnabled:    boolPtr(fixerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "fixer")),
+			WorkerDiscoveryEnabled:   boolPtr(workerConfigured && config.AnyProjectRoleAutoDiscoveryEnabled(cfg, "worker")),
+			OnHITLAsk:                notifyHITLAsk,
+			OnHITLAnswerDelivered:    notificationGateway.MarkAskAnswered,
+			NotifyHumanAttention:     notifyHumanAttention,
+			DrainHITLPair: func(ctx context.Context, loop storage.LoopRecord) error {
+				return drainReviewFixPairExecutions(ctx, services.Repositories, loop, services.ActiveExecutions)
+			},
+			ActiveExecutions: services.ActiveExecutions,
 		}
 	}
 
-	return defaultSchedulerHandlers{
+	// Webhook-driven discovery must not enroll new work without a live agent.
+	// Claim/tick still use the always-present runners for sticky snapshot retries.
+	var webhookReviewer reviewerScheduler
+	var webhookFixer fixerScheduler
+	if reviewerConfigured {
+		webhookReviewer = reviewerRunner
+	}
+	if fixerConfigured {
+		webhookFixer = fixerRunner
+	}
+	handlers := defaultSchedulerHandlers{
 		tick: func(ctx context.Context, services Services) error {
 			return runDefaultSchedulerTick(ctx, inputForServices(services))
 		},
 		claim: func(ctx context.Context, services Services) error {
 			return runIndependentClaimPass(ctx, inputForServices(services))
 		},
-		webhook: webhookforward.New(webhookforward.Options{
-			Repos:    repos,
-			Config:   cfg,
-			Reviewer: reviewerRunner,
-			Fixer:    fixerRunner,
-			Logger:   logger,
-			Now:      now,
-		}),
+		reviewer:             webhookReviewer,
+		fixer:                webhookFixer,
+		input:                inputForServices,
+		notificationGateways: notificationGateways,
 	}
+	if includeWebhook {
+		handlers.webhook = webhookforward.New(webhookforward.Options{
+			Repos:        repos,
+			Config:       cfg,
+			ConfigSource: configSource,
+			Reviewer:     webhookReviewer,
+			Fixer:        webhookFixer,
+			DiscoverProject: func(ctx context.Context, request webhookforward.ProjectDiscovery) error {
+				return discoverWebhookProject(ctx, inputForServices(Services{Repositories: repos, Coordinator: coordinator}), request)
+			},
+			Logger: logger,
+			Now:    now,
+		})
+	}
+	return handlers
 }
 
 func githubCLIAutoPROpeningAvailable(ctx context.Context, cfg config.Config, githubGateway *githubinfra.Gateway, logger bootstrap.Logger, repo, cwd string) bool {
@@ -1999,6 +4004,15 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	if input.Repos == nil || input.Repos.Projects == nil {
 		return nil
 	}
+	// Gate the entire work-producing tick (discovery, HITL, claims, stale
+	// reconcile), not only ClaimNext*. Admission closed during starting/stopping
+	// must not enqueue via CreateOrGetActiveByDedupe or requeue via reconcile.
+	if err := admissionRefuseWork(input); err != nil {
+		if input.Logger != nil {
+			input.Logger.Debug("scheduler tick skipped: admission closed", map[string]any{"error": err.Error()})
+		}
+		return nil
+	}
 
 	startedAt := time.Now()
 	claimStats := schedulerClaimStats{}
@@ -2039,15 +4053,18 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		appendErr(err)
 	}
 
-	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
-	recordClaim(claimedCount, availableSlots, err)
-
-	projectsList, err := input.Repos.Projects.List(ctx)
+	projectsList, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
 	if err != nil {
 		appendErr(err)
 		retErr = errors.Join(errs...)
 		return retErr
 	}
+	if !catalogCurrent {
+		return nil
+	}
+
+	claimedCount, availableSlots, err := executeClaimPhase(ctx, "pre_discovery", input, discoveredRunnableIDs, true)
+	recordClaim(claimedCount, availableSlots, err)
 	tickDiscoveryState := githubinfra.NewDiscoveryTickState()
 	projectSnapshots := map[string]*githubinfra.DiscoverySnapshot{}
 	projectSnapshot := func(projectID string) *githubinfra.DiscoverySnapshot {
@@ -2066,14 +4083,31 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			retErr = errors.Join(append(errs, err)...)
 			return retErr
 		}
+		// Recheck before each project's work-producing lanes so BeginShutdown
+		// during HTTP drain cannot leave a tick that passed the entry gate free
+		// to enqueue discovery/HITL after admission is already stopping.
+		if err := admissionRefuseWork(input); err != nil {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler tick stopped mid-flight: admission closed", map[string]any{"error": err.Error(), "projectId": project.ID})
+			}
+			break
+		}
 		if project.Archived {
 			continue
 		}
 		providerKind := config.ProviderKindGitHub
-		if input.Config != nil {
-			providerKind = runtimeProjectProviderKind(*input.Config, project.ID)
-		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
+		if input.Config != nil {
+			binding, ok := runtimeProjectBinding(*input.Config, project.ID)
+			if !ok {
+				if input.Logger != nil {
+					input.Logger.Debug("scheduler skipped project missing from captured catalog", map[string]any{"projectId": project.ID})
+				}
+				continue
+			}
+			providerKind = config.ResolvedProjectProviderKind(*input.Config, binding)
+			repo = strings.TrimSpace(binding.Repo)
+		}
 		var snapshot *githubinfra.DiscoverySnapshot
 		if providerKind == config.ProviderKindGitHub {
 			snapshot = projectSnapshot(project.ID)
@@ -2085,6 +4119,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			continue
 		}
 		if input.Planner != nil && discoveryEnabled(input.PlannerDiscoveryEnabled) {
+			if err := admissionRefuseWork(input); err != nil {
+				break
+			}
 			appendErr(runSchedulerLane(input, "planner discovery", project.ID, repo, func() error {
 				result, err := input.Planner.DiscoverIssues(ctx, planner.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -2096,11 +4133,14 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("planner auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Coordinator != nil && coordinatorEnabledForProject(input, project.ID) {
-			if providerKind != config.ProviderKindGitHub {
+			if !providerHasGitHubPullRequests(providerKind) {
 				if input.Logger != nil {
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "coordinator discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
 			} else {
+				if err := admissionRefuseWork(input); err != nil {
+					break
+				}
 				appendErr(runSchedulerLane(input, "coordinator discovery", project.ID, repo, func() error {
 					_, err := input.Coordinator.DiscoverIssues(ctx, coordinatorrole.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 					return wrapSchedulerError("coordinator discovery", project.ID, repo, err)
@@ -2110,6 +4150,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			}
 		}
 		if input.Reviewer != nil && discoveryEnabled(input.ReviewerDiscoveryEnabled) {
+			if err := admissionRefuseWork(input); err != nil {
+				break
+			}
 			appendErr(runSchedulerLane(input, "reviewer discovery", project.ID, repo, func() error {
 				result, err := input.Reviewer.DiscoverPullRequests(ctx, reviewer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -2121,11 +4164,14 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("reviewer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if input.Fixer != nil && discoveryEnabled(input.FixerDiscoveryEnabled) {
-			if providerKind != config.ProviderKindGitHub {
+			if !providerSupportsFixerDiscovery(providerKind) {
 				if input.Logger != nil {
 					input.Logger.Debug("scheduler skipped unsupported provider lane", map[string]any{"lane": "fixer discovery", "projectId": project.ID, "repo": repo, "provider": providerKind})
 				}
 			} else {
+				if err := admissionRefuseWork(input); err != nil {
+					break
+				}
 				appendErr(runSchedulerLane(input, "fixer discovery", project.ID, repo, func() error {
 					result, err := input.Fixer.DiscoverPullRequests(ctx, fixer.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 					trackRunnableDiscovery(result.QueueItems)
@@ -2138,6 +4184,9 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 			input.Logger.Debug("fixer auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
 		if discoverer, ok := input.Worker.(workerIssueDiscoveryScheduler); ok && discoveryEnabled(input.WorkerDiscoveryEnabled) {
+			if err := admissionRefuseWork(input); err != nil {
+				break
+			}
 			appendErr(runSchedulerLane(input, "worker issue discovery", project.ID, repo, func() error {
 				result, err := discoverer.DiscoverIssues(ctx, worker.DiscoveryInput{ProjectID: project.ID, Repo: repo, Snapshot: snapshot})
 				trackRunnableDiscovery(result.QueueItems)
@@ -2148,6 +4197,19 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 		} else if input.Worker != nil && input.Logger != nil && !discoveryEnabled(input.WorkerDiscoveryEnabled) {
 			input.Logger.Debug("worker auto-discovery disabled", map[string]any{"projectId": project.ID, "repo": repo})
 		}
+
+		// HITL (github transport): deliver any human answers posted on this
+		// project's awaiting_human PRs so those loops resume.
+		if err := admissionRefuseWork(input); err != nil {
+			break
+		}
+		runGitHubHITLPoll(ctx, input, project)
+	}
+
+	// HITL (feishu transport): poll the shared Cloudflare inbox once per tick and
+	// deliver any answers for this looper's awaiting loops.
+	if err := admissionRefuseWork(input); err == nil {
+		runFeishuHITLPoll(ctx, input)
 	}
 
 	claimedCount, availableSlots, err = executeClaimPhase(ctx, "post_discovery", input, discoveredRunnableIDs, true)
@@ -2158,6 +4220,16 @@ func runDefaultSchedulerTick(ctx context.Context, input defaultSchedulerTickInpu
 	}
 	retErr = errors.Join(errs...)
 	return retErr
+}
+
+// admissionRefuseWork rechecks the admission projection mid-tick. Nil AllowClaim
+// means ungated (tests). A non-nil error means admission is closed and the
+// caller must not start further discovery/HITL enqueue work.
+func admissionRefuseWork(input defaultSchedulerTickInput) error {
+	if input.AllowClaim == nil {
+		return nil
+	}
+	return input.AllowClaim()
 }
 
 func discoveryEnabled(value *bool) bool {
@@ -2227,14 +4299,59 @@ func (s *schedulerClaimStats) record(claimedCount, availableSlots int) {
 }
 
 func runIndependentClaimPass(ctx context.Context, input defaultSchedulerTickInput) error {
-	_, _, err := executeClaimPhase(ctx, "claim_pump", input, nil, false)
+	if input.AllowClaim != nil {
+		if err := input.AllowClaim(); err != nil {
+			return nil
+		}
+	}
+	_, catalogCurrent, err := schedulerProjectsForCapturedCatalog(ctx, input)
+	if err != nil || !catalogCurrent {
+		return err
+	}
+	_, _, err = executeClaimPhase(ctx, "claim_pump", input, nil, false)
 	return err
+}
+
+func schedulerProjectsForCapturedCatalog(ctx context.Context, input defaultSchedulerTickInput) ([]storage.ProjectRecord, bool, error) {
+	projectsList, err := input.Repos.Projects.List(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if input.Config == nil {
+		return projectsList, true, nil
+	}
+	for _, project := range projectsList {
+		if project.Archived {
+			continue
+		}
+		binding, ok := runtimeProjectBinding(*input.Config, project.ID)
+		if !ok || !catalogBindingMatchesProject(binding, project) {
+			if input.Logger != nil {
+				input.Logger.Debug("scheduler deferred pass until project catalog catches up", map[string]any{"projectId": project.ID})
+			}
+			return projectsList, false, nil
+		}
+	}
+	return projectsList, true, nil
 }
 
 func executeClaimPhase(ctx context.Context, phase string, input defaultSchedulerTickInput, discoveredRunnableIDs map[string]struct{}, alwaysLog bool) (int, int, error) {
 	if input.ClaimMu != nil {
 		input.ClaimMu.Lock()
 		defer input.ClaimMu.Unlock()
+	}
+	if input.ClaimBoundary != nil {
+		input.ClaimBoundary.RLock()
+		defer input.ClaimBoundary.RUnlock()
+	}
+	if input.RefreshForClaim != nil {
+		input = input.RefreshForClaim()
+	}
+	// Re-check after RefreshForClaim so a mid-tick catalog snapshot cannot open
+	// claims/reconcile after admission closed. Discovery/HITL recheck via
+	// admissionRefuseWork around each work-producing lane as well.
+	if err := admissionRefuseWork(input); err != nil {
+		return 0, 0, nil
 	}
 	start := time.Now()
 	availableSlots, err := schedulerAvailableSlots(ctx, input.Repos, input.MaxConcurrentRuns)
@@ -2243,6 +4360,12 @@ func executeClaimPhase(ctx context.Context, phase string, input defaultScheduler
 		return 0, 0, err
 	}
 	if availableSlots == 0 && input.ReconcileStaleRuns != nil {
+		// Recheck immediately before stale reconcile: availableSlots can race
+		// with BeginShutdown after the count returns, and ReconcileStaleRuns
+		// mutates runs/queue during the HTTP drain window.
+		if err := admissionRefuseWork(input); err != nil {
+			return 0, 0, nil
+		}
 		if _, err := input.ReconcileStaleRuns(ctx); err != nil {
 			logClaimPhase(input.Logger, phase, 0, 0, time.Since(start), err)
 			return 0, 0, err
@@ -2322,8 +4445,78 @@ func schedulerAvailableSlots(ctx context.Context, repos *storage.Repositories, m
 	return available, nil
 }
 
+// ownedQueueClaim is one durable running claim held under a Supervisor
+// operation lease until durable finalize (#579).
+type ownedQueueClaim struct {
+	item   storage.QueueItemRecord
+	lease  OperationLease
+	permit OperationPermit
+}
+
+// testAfterClaimHook, when set by tests, rewrites ClaimNext* results so the
+// ambiguous cancel path (durable claim committed, error returned) can be
+// exercised without racing SQLite QueryRowContext cancellation.
+var testAfterClaimHook func(item *storage.QueueItemRecord, err error) (*storage.QueueItemRecord, error)
+
+// allowedQueueTypesFromRunners returns queue item types that have a non-nil
+// runner processor. Prefer claimTypeSetsFromInput for claim filtering: that
+// path further splits live-configured roles from sticky-snapshot-only roles.
+func allowedQueueTypesFromRunners(input defaultSchedulerTickInput) []string {
+	types := make([]string, 0, 5)
+	if input.Planner != nil {
+		types = append(types, "planner")
+	}
+	if input.Reviewer != nil {
+		types = append(types, "reviewer")
+	}
+	if input.Fixer != nil {
+		types = append(types, "fixer")
+	}
+	if input.Worker != nil {
+		types = append(types, "worker")
+	}
+	if input.Snapshotter != nil {
+		types = append(types, "snapshot")
+	}
+	return types
+}
+
+// claimTypeSetsFromInput partitions claimable queue types:
+//   - unrestricted: live agent configured (or Config unset in unit tests), claim any item
+//   - stickySnapshotOnly: runner present but live ResolveAgent fails; claim only when the
+//     loop's latest run is failed/interrupted with a non-empty agent_snapshot_json vendor
+//
+// This keeps sticky retries claimable after vendor removal without starting fresh work
+// for unconfigured roles with empty agent identity.
+func claimTypeSetsFromInput(input defaultSchedulerTickInput) (unrestricted, stickySnapshotOnly []string) {
+	addCodingRole := func(queueType string, runnerPresent bool) {
+		if !runnerPresent {
+			return
+		}
+		// Unit tests often omit Config and inject only the runners under test;
+		// treat non-nil runners as fully claimable in that case.
+		if input.Config == nil || config.CodingRoleAgentConfigured(*input.Config, queueType) {
+			unrestricted = append(unrestricted, queueType)
+			return
+		}
+		stickySnapshotOnly = append(stickySnapshotOnly, queueType)
+	}
+	addCodingRole("planner", input.Planner != nil)
+	addCodingRole("reviewer", input.Reviewer != nil)
+	addCodingRole("fixer", input.Fixer != nil)
+	addCodingRole("worker", input.Worker != nil)
+	if input.Snapshotter != nil {
+		unrestricted = append(unrestricted, "snapshot")
+	}
+	return unrestricted, stickySnapshotOnly
+}
+
 func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, input defaultSchedulerTickInput) ([]storage.QueueItemRecord, error) {
 	if availableSlots <= 0 || input.Repos == nil || input.Repos.Queue == nil {
+		return nil, nil
+	}
+	unrestrictedTypes, stickySnapshotTypes := claimTypeSetsFromInput(input)
+	if len(unrestrictedTypes) == 0 && len(stickySnapshotTypes) == 0 {
 		return nil, nil
 	}
 	now := input.Now
@@ -2331,73 +4524,656 @@ func claimAndRunScheduledQueueItems(ctx context.Context, availableSlots int, inp
 		now = time.Now
 	}
 	nowISO := formatJavaScriptISOString(now().UTC())
+	owned := make([]ownedQueueClaim, 0, availableSlots)
 	queueItems := make([]storage.QueueItemRecord, 0, availableSlots)
+	// Recheck admission at each durable claim so BeginShutdown cannot race past
+	// an earlier pump-level AllowClaim and still ClaimNext under scheduler locks.
+	// If admission closes mid-batch after some ClaimNext* already persisted
+	// running/claimed items, stop claiming further slots but still process the
+	// items already claimed — never return them un-dispatched (stranded).
+	// The same invariant applies when BeginShutdown cancels the scheduler
+	// context mid-batch: stop further ClaimNext*, but still dispatch already
+	// durable claims (do not return the non-empty claimed slice with ctx.Err
+	// before runScheduledQueueItems).
+	//
+	// When OperationOwner is set (#579): AdmitOperation before each ClaimNext*,
+	// BindClaim after success (explicit permit), Release immediately on miss/
+	// error, and never start a processor without a valid permit.
+	admitClaim := func() error {
+		if input.AllowClaim == nil {
+			return nil
+		}
+		return input.AllowClaim()
+	}
+	// claimOne result: empty means this lane has no more candidates (try next
+	// lane); stop means halt all further ClaimNext*; err is a hard claim failure.
+	const (
+		claimContinue = iota
+		claimEmpty
+		claimStop
+	)
+	claimOne := func(claimFn func(context.Context, string, string) (*storage.QueueItemRecord, error)) (result int, claimErr error) {
+		if err := ctx.Err(); err != nil {
+			return claimStop, nil
+		}
+		if err := admitClaim(); err != nil {
+			return claimStop, nil
+		}
+		var lease OperationLease
+		if input.OperationOwner != nil {
+			var admitErr error
+			lease, admitErr = input.OperationOwner.AdmitOperation(ctx, OperationMeta{ClaimedBy: "scheduler"})
+			if admitErr != nil {
+				// Admission closed between AllowClaim and AdmitOperation.
+				return claimStop, nil
+			}
+		}
+		item, err := claimFn(ctx, nowISO, "scheduler")
+		if testAfterClaimHook != nil {
+			item, err = testAfterClaimHook(item, err)
+		}
+		if err != nil {
+			// Context cancel mid-ClaimNext can leave UPDATE...RETURNING committed
+			// without a returned item. Recover (or retain/degrade) before Release
+			// so a durable running claim is never left unowned (#579 / ADR-0015 R6).
+			if lease != nil && claimErrorIsAmbiguousCancel(ctx, err) {
+				recovered, recErr := recoverAmbiguousCancelledClaim(ctx, input, nowISO, owned)
+				if recErr != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(recErr)
+					}
+					// Retain lease — do not Release; BeginShutdown still observes it.
+					return claimStop, errors.Join(ErrOperationFinalizeFailed, recErr)
+				}
+				if recovered != nil {
+					item = recovered
+					err = nil
+				} else {
+					// Confirmed no durable claim under this tick — safe to drop lease.
+					lease.Release()
+					// BeginShutdown may cancel mid-ClaimNext after earlier slots
+					// succeeded. Stop claiming; dispatch already-durable claims.
+					return claimStop, nil
+				}
+			}
+		}
+		if err != nil {
+			if lease != nil {
+				lease.Release()
+			}
+			// BeginShutdown may cancel mid-ClaimNext after earlier slots succeeded.
+			// Stop claiming and dispatch already-durable claims instead of stranding.
+			if ctx.Err() != nil {
+				return claimStop, nil
+			}
+			return claimStop, err
+		}
+		if item == nil {
+			if lease != nil {
+				lease.Release()
+			}
+			// No candidate in this lane (e.g. non-long-term exhausted); caller may
+			// continue with long-term retry lane.
+			return claimEmpty, nil
+		}
+		if lease != nil {
+			permit, bindErr := lease.BindClaim(*item)
+			if bindErr != nil {
+				// Cancelled lease never starts the processor. Durable-requeue
+				// under retained ownership; Release only after requeue commits.
+				if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(finErr)
+					}
+					// Retain ownership — do not Release; do not dispatch.
+					return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
+				}
+				lease.Release()
+				return claimContinue, nil
+			}
+			if !permit.Valid() {
+				// Defensive: BindClaim must return a valid permit or error.
+				if finErr := finalizeCancelledClaim(ctx, *item, input, now); finErr != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(finErr)
+					}
+					return claimContinue, errors.Join(ErrOperationFinalizeFailed, finErr)
+				}
+				lease.Release()
+				return claimContinue, nil
+			}
+			owned = append(owned, ownedQueueClaim{item: *item, lease: lease, permit: permit})
+		} else {
+			// Tests without OperationOwner: claim without lease ownership.
+			owned = append(owned, ownedQueueClaim{item: *item})
+		}
+		queueItems = append(queueItems, *item)
+		return claimContinue, nil
+	}
+
+	stopClaiming := false
 	for i := 0; i < availableSlots; i++ {
-		if err := ctx.Err(); err != nil {
-			return queueItems, err
-		}
-		item, err := input.Repos.Queue.ClaimNextNonLongTermRetry(ctx, nowISO, "scheduler")
+		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
+			return input.Repos.Queue.ClaimNextNonLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+		})
 		if err != nil {
-			return queueItems, err
+			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
 		}
-		if item == nil {
+		if result == claimEmpty {
 			break
 		}
-		queueItems = append(queueItems, *item)
-	}
-	for len(queueItems) < availableSlots {
-		if err := ctx.Err(); err != nil {
-			return queueItems, err
-		}
-		item, err := input.Repos.Queue.ClaimNextLongTermRetry(ctx, nowISO, "scheduler")
-		if err != nil {
-			return queueItems, err
-		}
-		if item == nil {
+		if result == claimStop {
+			stopClaiming = true
 			break
 		}
-		queueItems = append(queueItems, *item)
 	}
-	return queueItems, runScheduledQueueItems(ctx, queueItems, input)
+	for !stopClaiming && len(queueItems) < availableSlots {
+		result, err := claimOne(func(ctx context.Context, nowISO, claimedBy string) (*storage.QueueItemRecord, error) {
+			return input.Repos.Queue.ClaimNextLongTermRetryAmongTypeSets(ctx, nowISO, claimedBy, unrestrictedTypes, stickySnapshotTypes)
+		})
+		if err != nil {
+			return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, err)
+		}
+		if result == claimEmpty || result == claimStop {
+			break
+		}
+	}
+	return queueItems, dispatchOwnedQueueClaims(ctx, owned, input, nil)
+}
+
+// claimErrorIsAmbiguousCancel reports whether a ClaimNext* error may have
+// already committed a durable running claim that was not returned to the caller
+// (context cancelled during UPDATE...RETURNING scan).
+func claimErrorIsAmbiguousCancel(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return ctx != nil && ctx.Err() != nil
+}
+
+// ambiguousClaimRecoveryTimeout bounds ListRunningClaimedBy after ClaimNext
+// cancel/deadline. Recovery must detach the caller deadline (an expired tick can
+// still observe a committed claim) without hanging forever if SQLite is blocked
+// while the operation lease remains pending.
+const ambiguousClaimRecoveryTimeout = 5 * time.Second
+
+// newAmbiguousClaimRecoveryContext returns a cancel-detached context with a
+// fresh timeout. Parent values are preserved when parent is non-nil; cancel and
+// deadline from the parent are not inherited.
+func newAmbiguousClaimRecoveryContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, ambiguousClaimRecoveryTimeout)
+}
+
+// recoverAmbiguousCancelledClaim looks up running claims made by the scheduler
+// at nowISO that are not already owned by this tick or by any live registry
+// operation lease. Zero matches means the cancel happened before any durable
+// claim (safe to release). One match is the recovered item. Multiple unowned
+// matches cannot be bound to a single lease.
+//
+// Filtering only the current batch's owned slice is insufficient: two claim
+// batches can share the same formatted nowISO (back-to-back wakeups within one
+// millisecond) and both use claimed_by="scheduler", so ListRunningClaimedBy
+// also returns earlier still-running claims. Those must be excluded via
+// OperationOwner.OwnsQueueClaim so recovery never adopts a registry-owned row
+// or degrades on a multi-match that includes live ownership.
+func recoverAmbiguousCancelledClaim(ctx context.Context, input defaultSchedulerTickInput, nowISO string, owned []ownedQueueClaim) (*storage.QueueItemRecord, error) {
+	if input.Repos == nil || input.Repos.Queue == nil {
+		return nil, errors.New("queue repository is not configured for ambiguous claim recovery")
+	}
+	// Bound recovery: WithoutCancel alone would wait indefinitely on blocked
+	// SQLite while the lease stays pending and shutdown times out retaining storage.
+	recoverCtx, cancel := newAmbiguousClaimRecoveryContext(ctx)
+	defer cancel()
+	items, err := input.Repos.Queue.ListRunningClaimedBy(recoverCtx, "scheduler", nowISO)
+	if err != nil {
+		return nil, err
+	}
+	ownedIDs := make(map[string]struct{}, len(owned))
+	for _, o := range owned {
+		if o.item.ID != "" {
+			ownedIDs[o.item.ID] = struct{}{}
+		}
+	}
+	var found *storage.QueueItemRecord
+	for i := range items {
+		id := items[i].ID
+		if _, ok := ownedIDs[id]; ok {
+			continue
+		}
+		// Prior-batch claims with the same claimed_at share this query result;
+		// skip any still bound to a live operation lease in the registry.
+		if input.OperationOwner != nil && input.OperationOwner.OwnsQueueClaim(id) {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("%w: multiple unowned running claims after cancelled ClaimNext", ErrOperationFinalizeFailed)
+		}
+		item := items[i]
+		found = &item
+	}
+	return found, nil
+}
+
+// cancelledClaimFinalizeTimeout bounds MarkRetryIfRunning/GetByID after a
+// stop/bind refuse. Finalize must detach the caller cancel/deadline (shutdown
+// or a timed tick can still require durable requeue) without hanging forever if
+// SQLite is blocked while the operation lease remains pending.
+const cancelledClaimFinalizeTimeout = 5 * time.Second
+
+// newCancelledClaimFinalizeContext returns a cancel-detached context with a
+// fresh timeout. Parent values are preserved when parent is non-nil; cancel and
+// deadline from the parent are not inherited.
+func newCancelledClaimFinalizeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	base := context.Background()
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	}
+	return context.WithTimeout(base, cancelledClaimFinalizeTimeout)
+}
+
+// finalizeCancelledClaim durable-requeues a claim that cannot start because the
+// operation lease was cancelled (stop/bind race). Keeps the claim out of the
+// stranded running state without starting a processor.
+//
+// Uses a cancellation-detached, time-bounded context: Runtime.BeginShutdown
+// cancels the scheduler context before the registry drain, so a bind refused
+// after ClaimNext* must still requeue under retained ownership (same pattern as
+// dispatchOwnedQueueClaims / ambiguous-claim recovery). Passing the cancelled
+// scheduler ctx would make MarkRetry fail immediately, report hard persist
+// failure, and strand the claim. WithoutCancel alone would drop a caller
+// deadline and wait indefinitely on blocked SQLite while the lease stays pending.
+//
+// Pause/terminal stop may CancelByLoop the claim to cancelled after ClaimNext*
+// and before BindClaim refuses. Use MarkRetryIfRunning so concurrent
+// terminalization yields a zero-row no-op treated as durable success (stop must
+// not resurrect cancelled work). Unrestricted MarkRetry is reserved for runner
+// finalize after processing, which may requeue after mid-run pause cancel.
+func finalizeCancelledClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
+	if input.Repos == nil || input.Repos.Queue == nil {
+		return errors.New("queue repository is not configured for cancelled-claim finalize")
+	}
+	// Bound finalization: detach cancel/deadline then apply a fresh timeout so
+	// shutdown/timed ticks still requeue without unbounded DB waits under a
+	// retained operation lease.
+	ctx, cancel := newCancelledClaimFinalizeContext(ctx)
+	defer cancel()
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	msg := "operation lease cancelled before queue processor start"
+	// Atomic status-guarded requeue: only updates while still running. Zero rows
+	// (already cancelled/completed/failed) is success — do not resurrect.
+	if err := input.Repos.Queue.MarkRetryIfRunning(ctx, storage.QueueMarkRetryInput{
+		ID:           item.ID,
+		AvailableAt:  nowISO,
+		Attempts:     item.Attempts,
+		ErrorMessage: &msg,
+		ErrorKind:    "retryable_transient",
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		return err
+	}
+	// Verify durable observation: still-running after guarded requeue means
+	// the write did not take effect (e.g. archived project) and ownership must
+	// not pretend finalize succeeded.
+	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if got == nil || got.Status == "running" {
+		return fmt.Errorf("%w: claim %s still running after requeue", ErrOperationFinalizeFailed, item.ID)
+	}
+	return nil
+}
+
+// dispatchOwnedQueueClaims launches processors for items already durable as
+// running/claimed under operation leases. Always detach the scheduler cancel:
+// BeginShutdown may race after a clean ctx.Err() check here but before
+// ProcessClaimedQueueItem runs its storage reads and Fail/Complete recovery
+// writes. Relying on cancellation already being visible at this exact check
+// strands claims as running/claimed_by=scheduler until a later recovery pass.
+func dispatchOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input defaultSchedulerTickInput, priorErr error) error {
+	if len(owned) == 0 {
+		return priorErr
+	}
+	dispatchCtx := ctx
+	if ctx != nil {
+		dispatchCtx = context.WithoutCancel(ctx)
+	}
+	runErr := runOwnedQueueClaims(dispatchCtx, owned, input)
+	return errors.Join(runErr, priorErr)
+}
+
+// dispatchClaimedQueueItems is retained for tests that build bare claim slices
+// without operation leases.
+func dispatchClaimedQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput, priorErr error) error {
+	owned := make([]ownedQueueClaim, 0, len(queueItems))
+	for _, item := range queueItems {
+		owned = append(owned, ownedQueueClaim{item: item})
+	}
+	return dispatchOwnedQueueClaims(ctx, owned, input, priorErr)
+}
+
+// schedulerLoopParked reports whether a claimed queue item's loop was parked
+// (human takeover / paused) — a state the scheduler may observe AFTER the claim
+// due to a race, and must then decline to run.
+//
+// Exception: a reviewer disposition-only item on a budget-held loop must still
+// run so same-head wontfix adjudication can refresh the handoff without a
+// Continue. Scope holds / human_takeover / non-budget awaiting_human stay parked.
+func schedulerLoopParked(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput) bool {
+	if item.LoopID == nil || input.Repos == nil || input.Repos.Loops == nil {
+		return false
+	}
+	loop, err := input.Repos.Loops.GetByID(ctx, *item.LoopID)
+	if err != nil || loop == nil {
+		return false
+	}
+	switch loop.Status {
+	case "human_takeover", "paused", "awaiting_human":
+		if item.Type == "reviewer" && payloadDispositionOnly(item.PayloadJSON) && loops.IsReviewFixBudgetHold(*loop) {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func payloadDispositionOnly(payloadJSON *string) bool {
+	if payloadJSON == nil || strings.TrimSpace(*payloadJSON) == "" {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(*payloadJSON), &payload); err != nil {
+		return false
+	}
+	v, ok := payload["dispositionOnly"].(bool)
+	return ok && v
 }
 
 func runScheduledQueueItems(ctx context.Context, queueItems []storage.QueueItemRecord, input defaultSchedulerTickInput) error {
-	if len(queueItems) == 0 {
+	owned := make([]ownedQueueClaim, 0, len(queueItems))
+	for _, item := range queueItems {
+		owned = append(owned, ownedQueueClaim{item: item})
+	}
+	return runOwnedQueueClaims(ctx, owned, input)
+}
+
+func runOwnedQueueClaims(ctx context.Context, owned []ownedQueueClaim, input defaultSchedulerTickInput) error {
+	if len(owned) == 0 {
 		return nil
 	}
 
+	now := input.Now
+	if now == nil {
+		now = time.Now
+	}
 	errList := make([]error, 0)
-	for _, item := range queueItems {
-		if err := ctx.Err(); err != nil {
-			return err
+	// Do not abort the launch loop on ctx cancel: every item is already durable
+	// as claimed/running under an operation lease. Skipping remaining launches
+	// strands those claims (BeginShutdown cancels the scheduler context during drain).
+	for _, claim := range owned {
+		item := claim.item
+		lease := claim.lease
+		permit := claim.permit
+
+		// A loop parked for human takeover (or paused) must never be run, even if a
+		// queue item survived a race with the parking and got claimed. Durable-
+		// complete the claim (so the slot frees) then Release the lease — only
+		// an explicit handback re-arms it.
+		if schedulerLoopParked(ctx, item, input) {
+			if err := durableCompleteClaim(ctx, item, input, now); err != nil {
+				errList = append(errList, err)
+				if lease != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(err)
+					}
+					// Retain ownership on finalize failure.
+				}
+			} else if lease != nil {
+				lease.Release()
+			}
+			if input.Logger != nil {
+				loopID := ""
+				if item.LoopID != nil {
+					loopID = *item.LoopID
+				}
+				input.Logger.Info("scheduler released claimed item for parked loop", map[string]any{"queueItemId": item.ID, "loopId": loopID})
+			}
+			continue
+		}
+
+		// Do not ClearLoopStop here. A claim can race with looper stop: pass the
+		// parked check while still running, then BeginLoopStop closes admission
+		// before launch. Unconditional clear would reopen the sticky gate for
+		// that pre-stop claim. Intentional re-activation (API unpause/retry/
+		// handback) is the authority that clears the gate.
+
+		// Stop/bind race: never start the processor without an explicit permit
+		// when OperationOwner is wired. Also refuse when the live lease was
+		// cancelled after BindClaim (BeginLoopStop / BeginShutdown): permit
+		// remains Valid() but the operation must not start. (Tests without
+		// owner skip this gate.)
+		leaseCancelled := lease != nil && lease.Context().Err() != nil
+		if input.OperationOwner != nil && (!permit.Valid() || leaseCancelled) {
+			if finErr := finalizeCancelledClaim(ctx, item, input, now); finErr != nil {
+				errList = append(errList, finErr)
+				if input.OperationOwner != nil {
+					input.OperationOwner.ReportHardPersistFailure(finErr)
+				}
+			} else if lease != nil {
+				lease.Release()
+			}
+			continue
 		}
 
 		process, err := schedulerQueueProcessor(item, input)
 		if err != nil {
+			// Processor missing: still durable-finalize when ownership is tracked
+			// so the claim is not left running under a released lease.
+			if lease != nil {
+				if finErr := ensureClaimFinalized(ctx, item, err, input, now); finErr != nil {
+					errList = append(errList, errors.Join(err, finErr))
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(finErr)
+					}
+					// Retain ownership when finalize fails.
+					continue
+				}
+				lease.Release()
+			}
 			errList = append(errList, err)
 			continue
 		}
-		item := item
 		processFn := process
+		run := func() {
+			// Processor work is owned by the operation lease, not the detached
+			// scheduler dispatch context. dispatchOwnedQueueClaims uses
+			// context.WithoutCancel so finalize survives BeginShutdown, but
+			// that must not keep the processor alive after the lease is
+			// cancelled (post-bind stop race, including delayed AsyncRunner).
+			processCtx := ctx
+			if lease != nil {
+				processCtx = lease.Context()
+				if processCtx.Err() != nil {
+					if finErr := finalizeCancelledClaim(ctx, item, input, now); finErr != nil {
+						if input.OperationOwner != nil {
+							input.OperationOwner.ReportHardPersistFailure(finErr)
+						}
+						if input.Logger != nil {
+							input.Logger.Warn("scheduler queue finalize failed; retaining operation lease", map[string]any{
+								"type": item.Type, "queueItemId": item.ID, "error": finErr.Error(),
+							})
+						}
+						// Retain ownership — do not Release.
+						return
+					}
+					lease.Release()
+					return
+				}
+			}
+			runErr := processFn(processCtx)
+			if lease != nil {
+				// Finalize-before-release: only drop ownership after durable
+				// complete/cancel/requeue (or typed Fail recovery). Keep using
+				// the detached dispatch ctx so durable writes still succeed
+				// when the lease was cancelled mid-run.
+				//
+				// When the lease was cancelled mid-run (BeginLoopStop before
+				// CancelByLoop / Terminate), do not Fail→manual_intervention.
+				// That status is outside CancelByLoop's WHERE (queued|running),
+				// so haltLoop would leave work on a terminated loop in a
+				// non-cancelled terminal state. Status-guarded requeue preserves
+				// concurrent CancelByLoop (zero-row no-op if already cancelled)
+				// and keeps the row cancellable until Terminate runs.
+				var finErr error
+				if lease.Context().Err() != nil {
+					finErr = finalizeCancelledClaim(ctx, item, input, now)
+				} else {
+					finErr = ensureClaimFinalized(ctx, item, runErr, input, now)
+				}
+				if finErr != nil {
+					if input.OperationOwner != nil {
+						input.OperationOwner.ReportHardPersistFailure(finErr)
+					}
+					if input.Logger != nil {
+						input.Logger.Warn("scheduler queue finalize failed; retaining operation lease", map[string]any{
+							"type": item.Type, "queueItemId": item.ID, "error": finErr.Error(),
+						})
+					}
+					// Retain ownership — do not Release.
+					return
+				}
+				lease.Release()
+			}
+			// Best-effort operator notify for durable human-attention parks.
+			// Never affects claim finalization or recovery.
+			//
+			// The dispatch ctx is WithoutCancel so finalize survives shutdown;
+			// do not keep notification transports on that detached lifetime.
+			// Daemon wiring (notifyHumanAttentionPostClaim) ignores this ctx and
+			// uses a runtime-owned cancelable parent that BeginShutdown cancels
+			// and Stop drains before SQLite close. Tests may pass a direct
+			// callback that uses the provided ctx.
+			if input.NotifyHumanAttention != nil && item.LoopID != nil {
+				input.NotifyHumanAttention(ctx, *item.LoopID)
+			}
+			if runErr != nil && input.Logger != nil {
+				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": runErr.Error()})
+			}
+		}
 
 		if input.AsyncRunner != nil {
-			input.AsyncRunner.Go(func() {
-				if err := processFn(ctx); err != nil && input.Logger != nil {
-					input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
-				}
-			})
+			input.AsyncRunner.Go(run)
 			continue
 		}
-		go func() {
-			if err := processFn(ctx); err != nil && input.Logger != nil {
-				input.Logger.Warn("scheduler queue item failed", map[string]any{"type": item.Type, "queueItemId": item.ID, "error": err.Error()})
-			}
-		}()
+		go run()
 	}
 	if len(errList) == 0 {
 		return nil
 	}
 	return errors.Join(errList...)
+}
+
+// durableCompleteClaim writes queue status completed and verifies the durable
+// observation left the running state.
+//
+// ErrQueueItemNotActive is not a hard persistence failure when the row is
+// already non-running: pause/terminate CancelByLoop can concurrent-terminalize
+// a claim to cancelled while the scheduler observes a parked loop and tries to
+// Complete. That race must free the operation lease rather than degrade and
+// retain ownership forever.
+func durableCompleteClaim(ctx context.Context, item storage.QueueItemRecord, input defaultSchedulerTickInput, now func() time.Time) error {
+	if input.Repos == nil || input.Repos.Queue == nil {
+		return errors.New("queue repository is not configured")
+	}
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	if err := input.Repos.Queue.Complete(ctx, item.ID, nowISO); err != nil {
+		if !errors.Is(err, storage.ErrQueueItemNotActive) {
+			return err
+		}
+		// Concurrent terminalization (e.g. CancelByLoop) already moved the claim
+		// off running — verify and treat as durable success for lease release.
+		got, getErr := input.Repos.Queue.GetByID(ctx, item.ID)
+		if getErr != nil {
+			return getErr
+		}
+		if got == nil || got.Status != "running" {
+			return nil
+		}
+		return fmt.Errorf("%w: claim %s still running after complete conflict", ErrOperationFinalizeFailed, item.ID)
+	}
+	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if got == nil || got.Status == "running" {
+		return fmt.Errorf("%w: claim %s still running after complete", ErrOperationFinalizeFailed, item.ID)
+	}
+	return nil
+}
+
+// ensureClaimFinalized guarantees typed durable finalization after a runner
+// returns. Happy-path runners already Complete/Fail; this closes the gap where
+// a runner error leaves status=running under a about-to-be-released lease.
+// Returns nil when the claim is no longer running (already finalized).
+func ensureClaimFinalized(ctx context.Context, item storage.QueueItemRecord, runErr error, input defaultSchedulerTickInput, now func() time.Time) error {
+	if input.Repos == nil || input.Repos.Queue == nil {
+		if runErr != nil {
+			return errors.New("queue repository is not configured for finalize")
+		}
+		return nil
+	}
+	got, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if got == nil || got.Status != "running" {
+		return nil
+	}
+	// Still running after processor return: typed durable finalization.
+	if now == nil {
+		now = time.Now
+	}
+	nowISO := formatJavaScriptISOString(now().UTC())
+	msg := "queue processor returned without durable finalize"
+	if runErr != nil {
+		msg = runErr.Error()
+	}
+	kind := "retryable_transient"
+	if runErr == nil {
+		kind = "non_retryable"
+	}
+	if err := input.Repos.Queue.Fail(ctx, storage.QueueFailInput{
+		ID:           item.ID,
+		Attempts:     got.Attempts,
+		FinishedAt:   nowISO,
+		ErrorMessage: &msg,
+		ErrorKind:    kind,
+		UpdatedAt:    nowISO,
+	}); err != nil {
+		return err
+	}
+	after, err := input.Repos.Queue.GetByID(ctx, item.ID)
+	if err != nil {
+		return err
+	}
+	if after == nil || after.Status == "running" {
+		return fmt.Errorf("%w: claim %s still running after fail", ErrOperationFinalizeFailed, item.ID)
+	}
+	return nil
 }
 
 func schedulerQueueProcessor(item storage.QueueItemRecord, input defaultSchedulerTickInput) (func(context.Context) error, error) {
@@ -2470,6 +5246,13 @@ func processSnapshotQueueItem(ctx context.Context, item storage.QueueItemRecord,
 	if now == nil {
 		now = time.Now
 	}
+	if input.Config != nil {
+		bound, bindErr := hostingidentity.Bind(ctx, *input.Config, project.ID, "reviewer")
+		if bindErr != nil {
+			return failSnapshotQueueItem(ctx, item, input, bindErr.Error(), "non_retryable")
+		}
+		ctx = bound
+	}
 	snapshot, err := input.Snapshotter.CapturePullRequestSnapshot(ctx, githubinfra.CapturePullRequestSnapshotInput{ProjectID: project.ID, Repo: *item.Repo, PRNumber: *item.PRNumber, CWD: cwd, CapturedAt: formatJavaScriptISOString(now().UTC())})
 	if err != nil {
 		return failSnapshotQueueItem(ctx, item, input, err.Error(), "retryable_transient")
@@ -2520,6 +5303,18 @@ func repoFromProjectMetadata(metadataJSON *string) string {
 	}
 	repo, _ := metadata["repo"].(string)
 	return strings.TrimSpace(repo)
+}
+
+func catalogBindingMatchesProject(binding config.ProjectRefConfig, project storage.ProjectRecord) bool {
+	metadata := map[string]any{}
+	if project.MetadataJSON != nil && strings.TrimSpace(*project.MetadataJSON) != "" {
+		if err := json.Unmarshal([]byte(*project.MetadataJSON), &metadata); err != nil {
+			return false
+		}
+	}
+	provider, _ := metadata["provider"].(string)
+	return strings.TrimSpace(binding.Provider) == strings.TrimSpace(provider) &&
+		strings.TrimSpace(binding.Repo) == repoFromProjectMetadata(project.MetadataJSON)
 }
 
 func wrapSchedulerError(action, projectID, repo string, err error) error {

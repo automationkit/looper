@@ -22,9 +22,12 @@ type ShutdownRuntime interface {
 }
 
 type RuntimeDependencies struct {
-	Config   config.Config
-	Metadata config.LoadFileMetadata
-	Logger   Logger
+	Config        config.Config
+	Metadata      config.LoadFileMetadata
+	InitialConfig config.LoadedFileConfig
+	ReloadConfig  func() (config.LoadedFileConfig, error)
+	LoadConfigAt  func(string) (config.LoadedFileConfig, error)
+	Logger        Logger
 }
 
 type LoadConfigFunc func(config.LoadFileOptions) (config.LoadedFileConfig, error)
@@ -63,11 +66,24 @@ func Bootstrap(ctx context.Context, options Options) (Result, error) {
 	if loadConfig == nil {
 		loadConfig = config.LoadFile
 	}
+	cwd := strings.TrimSpace(options.CWD)
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			return Result{}, fmt.Errorf("determine bootstrap working directory: %w", err)
+		}
+	}
+	env := cloneEnvironment(options.Env)
+	if options.Env == nil {
+		env = currentEnvironment()
+	}
+	args := append([]string(nil), options.Args...)
 
 	loadedConfig, err := loadConfig(config.LoadFileOptions{
-		CWD:       options.CWD,
-		Args:      options.Args,
-		LookupEnv: envLookupFromMap(options.Env),
+		CWD:       cwd,
+		Args:      args,
+		LookupEnv: envLookupFromMap(env),
 	})
 	if err != nil {
 		return Result{}, err
@@ -109,10 +125,35 @@ func Bootstrap(ctx context.Context, options Options) (Result, error) {
 		return result, nil
 	}
 
+	reloadOptions := config.LoadFileOptions{
+		CWD:                cwd,
+		Args:               append([]string(nil), args...),
+		LookupEnv:          envLookupFromMap(env),
+		ConfigPathOverride: loadedConfig.Metadata.ConfigPath,
+	}
+	loadReloadCandidate := func(loadOptions config.LoadFileOptions) (config.LoadedFileConfig, error) {
+		candidate, err := loadConfig(loadOptions)
+		if err != nil {
+			return config.LoadedFileConfig{}, err
+		}
+		if err := validateConfiguredToolPaths(candidate.Config, candidate.Metadata.ToolDetection); err != nil {
+			return config.LoadedFileConfig{}, err
+		}
+		return candidate, nil
+	}
 	runtime, err := options.StartRuntime(ctx, RuntimeDependencies{
-		Config:   loadedConfig.Config,
-		Metadata: loadedConfig.Metadata,
-		Logger:   logger,
+		Config:        loadedConfig.Config,
+		Metadata:      loadedConfig.Metadata,
+		InitialConfig: loadedConfig,
+		ReloadConfig: func() (config.LoadedFileConfig, error) {
+			return loadReloadCandidate(reloadOptions)
+		},
+		LoadConfigAt: func(path string) (config.LoadedFileConfig, error) {
+			options := reloadOptions
+			options.ConfigPathOverride = path
+			return loadReloadCandidate(options)
+		},
+		Logger: logger,
 	})
 	if err != nil {
 		return Result{}, err
@@ -151,6 +192,14 @@ func signalNotifierOrDefault(notifier SignalNotifier) SignalNotifier {
 }
 
 func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.ToolDetectionStatus) error {
+	// Bot agents need the trusted hosting CLI even when the daemon itself is
+	// launched with go run. Check this before readiness and on config reload.
+	if len(cfg.Identities) > 0 && (cfg.Tools.LooperPath == nil || strings.TrimSpace(*cfg.Tools.LooperPath) == "") {
+		return &config.ConfigValidationError{Issues: []config.ValidationIssue{{
+			Path:    "tools.looperPath",
+			Message: "hosting bot identities require the looper CLI; build it with go build -o dist/looper ./cmd/looper and set tools.looperPath to its absolute path, or install looper on PATH",
+		}}}
+	}
 	checks := []struct {
 		statusKey string
 		field     string
@@ -158,6 +207,7 @@ func validateConfiguredToolPaths(cfg config.Config, detection map[string]config.
 	}{
 		{statusKey: "gitPath", field: "tools.gitPath", path: cfg.Tools.GitPath},
 		{statusKey: "ghPath", field: "tools.ghPath", path: cfg.Tools.GHPath},
+		{statusKey: "looperPath", field: "tools.looperPath", path: cfg.Tools.LooperPath},
 		{statusKey: "osascriptPath", field: "tools.osascriptPath", path: cfg.Tools.OsascriptPath},
 	}
 	for _, check := range checks {
@@ -282,4 +332,26 @@ func envLookupFromMap(env map[string]string) config.EnvLookupFunc {
 		value, ok := env[key]
 		return value, ok
 	}
+}
+
+func cloneEnvironment(env map[string]string) map[string]string {
+	if env == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(env))
+	for key, value := range env {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func currentEnvironment() map[string]string {
+	env := make(map[string]string)
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			env[key] = value
+		}
+	}
+	return env
 }

@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	"github.com/nexu-io/looper/internal/infra/shell"
 	"github.com/nexu-io/looper/internal/storage"
 	"github.com/nexu-io/looper/internal/worktreesafety"
@@ -72,6 +74,7 @@ type PrepareWorktreeInput struct {
 	Branch          string
 	Ref             string
 	ExpectedHeadSHA string
+	BaseSHA         string
 	Remote          string
 }
 
@@ -112,6 +115,26 @@ type CleanupWorktreeInput struct {
 	WorktreePath      string
 	Branch            string
 	ProtectedBranches []string
+	// AdmitStart, when set, wraps the destructive `git worktree remove`
+	// process Start so callers can hold admission across Start only (not
+	// Wait). Runtime cleanup uses this for R7 atomicity with MarkDegraded:
+	// point-in-time AllowClaim leaves a window before cmd.Start.
+	AdmitStart func(start func() error) error
+}
+
+// DiscardWorktreeChangesInput discards tracked and untracked local changes in a
+// managed worktree, leaving HEAD and the worktree directory itself intact.
+type DiscardWorktreeChangesInput struct {
+	RepoPath     string
+	WorktreeRoot string
+	WorktreePath string
+}
+
+// DiscardWorktreeChangesResult reports whether discard mutated the worktree.
+type DiscardWorktreeChangesResult struct {
+	WorktreePath string
+	WasDirty     bool
+	NoOp         bool
 }
 
 type PushInput struct {
@@ -142,6 +165,7 @@ func (e *ProtectedBranchError) Error() string {
 type RemoteHeadChangedError struct {
 	Branch          string
 	ExpectedHeadSHA string
+	BaseSHA         string
 	ActualHeadSHA   string
 }
 
@@ -220,6 +244,17 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		return *restored, nil
 	}
 
+	// Unregistered hollow leftovers block `git worktree add`. Clear only when
+	// local metadata proves the path is not a usable checkout; preserve any
+	// other content for manual intervention.
+	if err := worktreesafety.EnsureUnusableManagedPathCleared(worktreesafety.CheckInput{
+		WorktreePath: worktreePath,
+		RepoPath:     input.RepoPath,
+		WorktreeRoot: input.WorktreeRoot,
+	}, worktreePath); err != nil {
+		return storage.WorktreeRecord{}, err
+	}
+
 	if checkoutMode == CheckoutModeDetached {
 		startPoint, err := g.resolveDetachedStartPoint(ctx, input)
 		if err != nil {
@@ -246,6 +281,17 @@ func (g *Gateway) CreateWorktree(ctx context.Context, input CreateWorktreeInput)
 		if err := g.runGit(ctx, input.RepoPath, nil, args...); err != nil {
 			return storage.WorktreeRecord{}, err
 		}
+	}
+
+	// Keep common build artifacts (e.g. .pnpm-store/, node_modules/) out of every
+	// loop commit via the worktree-local git exclude file. Best-effort.
+	g.applyWorktreeArtifactExcludes(ctx, worktreePath)
+	// Any CreateWorktree claim invalidates prior fixer ownership so path equality
+	// alone cannot authorize dirty adopt after another runner used this directory.
+	// Fail the claim if the marker cannot be revoked — stale authority is worse
+	// than a retryable create error.
+	if err := worktreesafety.ClearFixerOwnerToken(worktreePath); err != nil {
+		return storage.WorktreeRecord{}, err
 	}
 
 	headSHA, err := g.getHeadSHA(ctx, worktreePath)
@@ -298,12 +344,32 @@ func (g *Gateway) ListWorktrees(ctx context.Context, repoPath string) ([]Worktre
 }
 
 func (g *Gateway) DetectGitHubRepo(ctx context.Context, repoPath string) (string, error) {
-	result, err := g.runGitResult(ctx, repoPath, nil, "config", "--get", "remote.origin.url")
+	remote, err := g.DetectOriginRemote(ctx, repoPath)
 	if err != nil {
 		return "", err
 	}
+	if !isGitHubRemoteHost(remote.Host) {
+		return "", nil
+	}
+	return remote.Repo, nil
+}
 
-	return parseGitHubRepoFromRemoteURL(strings.TrimSpace(result.Stdout)), nil
+// OriginRemote is the parsed remote.origin URL for a local checkout.
+type OriginRemote struct {
+	URL  string
+	Host string
+	Repo string // owner/name
+}
+
+// DetectOriginRemote reads remote.origin.url and extracts host + owner/name when possible.
+func (g *Gateway) DetectOriginRemote(ctx context.Context, repoPath string) (OriginRemote, error) {
+	result, err := g.runGitResult(ctx, repoPath, nil, "config", "--get", "remote.origin.url")
+	if err != nil {
+		return OriginRemote{}, err
+	}
+	remoteURL := strings.TrimSpace(result.Stdout)
+	host, repo := parseRemoteRepoFromURL(remoteURL)
+	return OriginRemote{URL: remoteURL, Host: host, Repo: repo}, nil
 }
 
 func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInput) (*storage.WorktreeRecord, error) {
@@ -321,6 +387,16 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 			}
 			if !storedHealthy {
 				g.tryRemoveWorktree(ctx, input.RepoPath, stored.WorktreePath)
+				// Hollow/unregistered leftovers survive `worktree remove`. Clear
+				// empty or metadata-only paths so Create can recreate; preserve
+				// populated unusable paths as MI instead of infinite retry.
+				if err := worktreesafety.EnsureUnusableManagedPathCleared(worktreesafety.CheckInput{
+					WorktreePath: stored.WorktreePath,
+					RepoPath:     input.RepoPath,
+					WorktreeRoot: input.WorktreeRoot,
+				}, stored.WorktreePath); err != nil {
+					return nil, err
+				}
 			} else {
 				storedCheckoutMatches, err := g.matchesRestoreCheckoutMode(ctx, stored.WorktreePath, checkoutMode, input.Branch)
 				if err != nil {
@@ -338,6 +414,11 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 					restored.UpdatedAt = nowISO
 					if err := g.repos.Worktrees.Upsert(ctx, restored); err != nil {
 						return nil, fmt.Errorf("upsert restored worktree record: %w", err)
+					}
+					g.applyWorktreeArtifactExcludes(ctx, restored.WorktreePath)
+					// Restoring for a new CreateWorktree claim drops prior fixer ownership.
+					if err := worktreesafety.ClearFixerOwnerToken(restored.WorktreePath); err != nil {
+						return nil, err
 					}
 					return &restored, nil
 				}
@@ -388,6 +469,13 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 	}
 	if !healthy {
 		g.tryRemoveWorktree(ctx, input.RepoPath, match.Path)
+		if err := worktreesafety.EnsureUnusableManagedPathCleared(worktreesafety.CheckInput{
+			WorktreePath: match.Path,
+			RepoPath:     input.RepoPath,
+			WorktreeRoot: input.WorktreeRoot,
+		}, match.Path); err != nil {
+			return nil, err
+		}
 		return nil, nil
 	}
 
@@ -441,17 +529,28 @@ func (g *Gateway) RestoreWorktree(ctx context.Context, input RestoreWorktreeInpu
 		}
 	}
 
+	g.applyWorktreeArtifactExcludes(ctx, record.WorktreePath)
+	if err := worktreesafety.ClearFixerOwnerToken(record.WorktreePath); err != nil {
+		return nil, err
+	}
 	return &record, nil
 }
 
 func (g *Gateway) CleanupWorktree(ctx context.Context, input CleanupWorktreeInput) error {
+	// Refuse before any filesystem mutation when the cleanup context was
+	// canceled (MarkDegraded/BeginShutdown cancel under admission.mu).
+	// When AdmitStart is set, Start is rechecked under that gate; this is the
+	// pre-validation fast path only.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := g.AssertWritableBranch(input.Branch, input.ProtectedBranches); err != nil {
 		return err
 	}
 	if err := worktreesafety.Validate(worktreesafety.CheckInput{WorktreePath: input.WorktreePath, RepoPath: input.RepoPath, WorktreeRoot: input.WorktreeRoot}); err != nil {
 		return err
 	}
-	if err := g.runGit(ctx, input.RepoPath, nil, "worktree", "remove", "--force", input.WorktreePath); err != nil {
+	if err := g.runGitWithStartGate(ctx, input.RepoPath, nil, input.AdmitStart, "worktree", "remove", "--force", input.WorktreePath); err != nil {
 		if !missingWorktreeErrorPattern.MatchString(err.Error()) {
 			return err
 		}
@@ -491,6 +590,63 @@ func (g *Gateway) WorktreeClean(ctx context.Context, worktreePath string) (bool,
 
 func (g *Gateway) IsWorktreeClean(ctx context.Context, worktreePath string) (bool, error) {
 	return g.WorktreeClean(ctx, worktreePath)
+}
+
+// DiscardWorktreeChanges hard-resets tracked files and removes untracked files
+// in a managed worktree. It never deletes the worktree directory, remote
+// branches, or force-pushes.
+func (g *Gateway) DiscardWorktreeChanges(ctx context.Context, input DiscardWorktreeChangesInput) (DiscardWorktreeChangesResult, error) {
+	worktreePath := strings.TrimSpace(input.WorktreePath)
+	if worktreePath == "" {
+		return DiscardWorktreeChangesResult{}, fmt.Errorf("worktree path is required")
+	}
+	if err := g.validateMutationWorktree(worktreePath, input.RepoPath, input.WorktreeRoot); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return DiscardWorktreeChangesResult{WorktreePath: worktreePath, NoOp: true}, nil
+		}
+		return DiscardWorktreeChangesResult{}, err
+	}
+
+	clean, err := g.WorktreeClean(ctx, worktreePath)
+	if err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if clean {
+		return DiscardWorktreeChangesResult{WorktreePath: worktreePath, WasDirty: false, NoOp: true}, nil
+	}
+
+	// Recurse into submodules so a dirty tracked submodule is reset with the
+	// superproject. Without --recurse-submodules, top-level tracked edits are
+	// discarded while submodule dirt remains, and the post-clean check fails
+	// after partial discard (not all-or-nothing for repos with submodules).
+	if err := g.runGit(ctx, worktreePath, nil, "reset", "--hard", "--recurse-submodules", "HEAD"); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	// Double -f is required so git clean also removes nested repositories
+	// (untracked checkouts with their own .git). Single -f leaves those
+	// behind, which fails the post-clean cleanliness check after tracked
+	// edits were already discarded via reset --hard.
+	if err := g.runGit(ctx, worktreePath, nil, "clean", "-ffd"); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	// Top-level clean does not enter tracked submodules. Reset+clean each
+	// submodule so untracked/modified files inside them are discarded too.
+	// No-op when the worktree has no submodules.
+	if err := g.runGit(ctx, worktreePath, nil, "submodule", "foreach", "--recursive", "git reset --hard && git clean -ffd"); err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+
+	clean, err = g.WorktreeClean(ctx, worktreePath)
+	if err != nil {
+		return DiscardWorktreeChangesResult{}, err
+	}
+	if !clean {
+		return DiscardWorktreeChangesResult{}, fmt.Errorf("worktree still dirty after discard at %s", worktreePath)
+	}
+	return DiscardWorktreeChangesResult{WorktreePath: worktreePath, WasDirty: true, NoOp: false}, nil
 }
 
 func (g *Gateway) Push(ctx context.Context, input PushInput) error {
@@ -556,6 +712,12 @@ func (g *Gateway) PrepareWorktree(ctx context.Context, input PrepareWorktreeInpu
 	}
 	if targetSpec == "" {
 		return PrepareWorktreeResult{}, fmt.Errorf("branch or ref is required")
+	}
+	// Fetch the immutable base before the PR head: the head fetch owns FETCH_HEAD.
+	if input.BaseSHA != "" {
+		if err := g.runGit(ctx, input.WorktreePath, nil, "fetch", remote, input.BaseSHA); err != nil {
+			return PrepareWorktreeResult{}, err
+		}
 	}
 	if err := g.runGit(ctx, input.WorktreePath, nil, "fetch", remote, targetSpec); err != nil {
 		return PrepareWorktreeResult{}, err
@@ -816,6 +978,51 @@ func (g *Gateway) FetchBranch(ctx context.Context, repoPath, remote, branch stri
 	return g.runGit(ctx, repoPath, nil, "fetch", remote, branch)
 }
 
+// MergeBaseInput asks to merge a remote base branch into a worktree.
+type MergeBaseInput struct {
+	WorktreePath string
+	Remote       string
+	BaseBranch   string
+}
+
+// MergeBaseResult reports the outcome of a base merge.
+type MergeBaseResult struct {
+	AlreadyUpToDate bool
+	// Conflicted is true when the merge left conflict markers in the worktree for
+	// an agent to resolve (the merge is intentionally NOT aborted in that case).
+	Conflicted bool
+}
+
+// MergeBaseIntoWorktree fetches the base branch and merges it into the worktree.
+// On a clean merge it returns AlreadyUpToDate as appropriate; on conflicts it
+// leaves the conflict markers in place and returns Conflicted=true so the caller
+// can hand the worktree to an agent; on any other merge failure it aborts to keep
+// the worktree clean and returns the error.
+func (g *Gateway) MergeBaseIntoWorktree(ctx context.Context, input MergeBaseInput) (MergeBaseResult, error) {
+	remote := strings.TrimSpace(input.Remote)
+	if remote == "" {
+		remote = "origin"
+	}
+	base := strings.TrimSpace(input.BaseBranch)
+	if base == "" {
+		return MergeBaseResult{}, fmt.Errorf("base branch is required")
+	}
+	if err := g.FetchBranch(ctx, input.WorktreePath, remote, base); err != nil {
+		return MergeBaseResult{}, err
+	}
+	res, err := g.runGitResult(ctx, input.WorktreePath, nil, "merge", "--no-edit", remote+"/"+base)
+	out := res.Stdout + res.Stderr
+	if err == nil {
+		return MergeBaseResult{AlreadyUpToDate: strings.Contains(out, "Already up to date")}, nil
+	}
+	if strings.Contains(out, "CONFLICT") || strings.Contains(out, "Automatic merge failed") {
+		return MergeBaseResult{Conflicted: true}, nil
+	}
+	// Some other merge failure — abort so the worktree isn't left half-merged.
+	_, _ = g.runGitResult(ctx, input.WorktreePath, nil, "merge", "--abort")
+	return MergeBaseResult{}, err
+}
+
 func (g *Gateway) isAncestor(ctx context.Context, repoPath, ancestor, descendant string) (bool, error) {
 	_, err := g.runGitResult(ctx, repoPath, nil, "merge-base", "--is-ancestor", ancestor, descendant)
 	if err == nil {
@@ -834,6 +1041,15 @@ func (g *Gateway) isHealthyWorktree(ctx context.Context, worktreePath string) (b
 			return false, nil
 		}
 		return false, err
+	}
+
+	// Confirmed local-unusable (hollow/corrupt metadata): treat as unhealthy
+	// without propagating git status. Restore can remove + clear + recreate
+	// instead of infinite retryable_transient storms.
+	// Usable local metadata with a failing `git status` still propagates —
+	// that may be locks, permissions, or other non-hollow failures.
+	if !worktreesafety.LocalCheckoutUsable(worktreePath) {
+		return false, nil
 	}
 
 	_, err := g.runGitResult(ctx, worktreePath, nil, "status", "--porcelain", "--untracked-files=all")
@@ -894,6 +1110,91 @@ func (g *Gateway) tryRemoveWorktree(ctx context.Context, repoPath, worktreePath 
 	if err := g.runGit(ctx, repoPath, nil, "worktree", "remove", "--force", worktreePath); err != nil {
 		return
 	}
+}
+
+// worktreeArtifactExcludePatterns are common build-artifact directories/files
+// that must never be committed by the agent or by looper's fallback commit. On
+// pnpm/node repos whose .gitignore misses one of these (e.g. .pnpm-store/, a
+// 100MB+ content store), an `git add -A` would otherwise stage it and the push
+// would be rejected. The list is intentionally conservative — only universal
+// build output, never source.
+var worktreeArtifactExcludePatterns = []string{
+	".pnpm-store/",
+	"node_modules/",
+	".turbo/",
+	"dist/",
+	".next/",
+	".cache/",
+	"*.log",
+}
+
+const worktreeExcludeManagedHeader = "# looper: build-artifact excludes (managed; safe to remove)"
+
+// applyWorktreeArtifactExcludes appends looper's build-artifact ignore patterns
+// to the worktree's git exclude file (info/exclude). That file is local to this
+// clone and is never committed, so it cannot alter the repo's tracked files or
+// its .gitignore. The write is idempotent (patterns already present are skipped)
+// and best-effort: any failure is swallowed so it never blocks a loop worktree.
+func (g *Gateway) applyWorktreeArtifactExcludes(ctx context.Context, worktreePath string) {
+	if strings.TrimSpace(worktreePath) == "" {
+		return
+	}
+	result, err := g.runGitResult(ctx, worktreePath, nil, "rev-parse", "--git-path", "info/exclude")
+	if err != nil {
+		return
+	}
+	excludePath := strings.TrimSpace(result.Stdout)
+	if excludePath == "" {
+		return
+	}
+	if !filepath.IsAbs(excludePath) {
+		excludePath = filepath.Join(worktreePath, excludePath)
+	}
+
+	existing, err := os.ReadFile(excludePath)
+	if err != nil && !os.IsNotExist(err) {
+		return
+	}
+	existingText := string(existing)
+
+	missing := make([]string, 0, len(worktreeArtifactExcludePatterns))
+	for _, pattern := range worktreeArtifactExcludePatterns {
+		if !worktreeExcludeContainsPattern(existingText, pattern) {
+			missing = append(missing, pattern)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(excludePath), 0o755); err != nil {
+		return
+	}
+	var builder strings.Builder
+	builder.WriteString(existingText)
+	if existingText != "" && !strings.HasSuffix(existingText, "\n") {
+		builder.WriteByte('\n')
+	}
+	if !strings.Contains(existingText, worktreeExcludeManagedHeader) {
+		builder.WriteString(worktreeExcludeManagedHeader)
+		builder.WriteByte('\n')
+	}
+	for _, pattern := range missing {
+		builder.WriteString(pattern)
+		builder.WriteByte('\n')
+	}
+	_ = os.WriteFile(excludePath, []byte(builder.String()), 0o644)
+}
+
+// worktreeExcludeContainsPattern reports whether pattern already appears as its
+// own line in the exclude file (ignoring surrounding whitespace).
+func worktreeExcludeContainsPattern(content, pattern string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		if strings.TrimSpace(line) == pattern {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *Gateway) getRemoteHeadSHA(ctx context.Context, repoPath, remote, branch string) (string, error) {
@@ -967,6 +1268,11 @@ func (g *Gateway) runGit(ctx context.Context, cwd string, env map[string]string,
 	return err
 }
 
+func (g *Gateway) runGitWithStartGate(ctx context.Context, cwd string, env map[string]string, startGate func(start func() error) error, args ...string) error {
+	_, err := g.runGitResultOnceWithStartGate(ctx, cwd, env, startGate, args...)
+	return err
+}
+
 func (g *Gateway) runGitResult(ctx context.Context, cwd string, env map[string]string, args ...string) (shell.Result, error) {
 	var result shell.Result
 	var err error
@@ -987,9 +1293,22 @@ func (g *Gateway) runGitResult(ctx context.Context, cwd string, env map[string]s
 }
 
 func (g *Gateway) runGitResultOnce(ctx context.Context, cwd string, env map[string]string, args ...string) (shell.Result, error) {
-	result, err := shell.Run(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env})
+	return g.runGitResultOnceWithStartGate(ctx, cwd, env, nil, args...)
+}
+
+func (g *Gateway) runGitResultOnceWithStartGate(ctx context.Context, cwd string, env map[string]string, startGate func(start func() error) error, args ...string) (shell.Result, error) {
+	result, err := hostingidentity.RunGit(ctx, shell.Options{Command: g.gitPath, Args: args, CWD: cwd, Env: env, StartGate: startGate}, nil)
 	if err == nil {
 		return result, nil
+	}
+	commandLabel := strings.Join(args, " ")
+	if _, selected := hostingidentity.FromContext(ctx); selected {
+		// A rejected destination may itself contain credentials. Keep it out
+		// of the gateway's outer error as well as the transport's diagnostics.
+		commandLabel = "operation"
+		if len(args) > 0 {
+			commandLabel = args[0]
+		}
 	}
 
 	var commandErr *shell.CommandExecutionError
@@ -1003,10 +1322,10 @@ func (g *Gateway) runGitResultOnce(ctx context.Context, cwd string, env map[stri
 		}
 		formatted := *commandErr
 		formatted.Message = message
-		return formatted.Result, fmt.Errorf("git %s: %w", strings.Join(args, " "), &formatted)
+		return formatted.Result, fmt.Errorf("git %s: %w", commandLabel, &formatted)
 	}
 
-	return result, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	return result, fmt.Errorf("git %s: %w", commandLabel, err)
 }
 
 func isRetryableFetchRefLockRace(args []string, err error) bool {
@@ -1028,29 +1347,79 @@ func buildWorktreeDirectoryName(input CreateWorktreeInput) string {
 	return sanitizeBranchName(input.Branch)
 }
 
-func parseGitHubRepoFromRemoteURL(remoteURL string) string {
-	if remoteURL == "" {
+// DetachedPRWorktreePath returns the managed shared detached worktree path that
+// CreateWorktree claims for a PR (looper-fix-<project>-pr-<N>-detached).
+// Callers that must read ownership markers before CreateWorktree revokes them
+// should probe this candidate path even when no checkpoint worktree exists.
+func DetachedPRWorktreePath(worktreeRoot, projectID string, prNumber int64) string {
+	worktreeRoot = strings.TrimSpace(worktreeRoot)
+	projectID = strings.TrimSpace(projectID)
+	if worktreeRoot == "" || projectID == "" || prNumber == 0 {
 		return ""
 	}
+	return filepath.Join(worktreeRoot, buildWorktreeDirectoryName(CreateWorktreeInput{
+		ProjectID:    projectID,
+		PRNumber:     prNumber,
+		CheckoutMode: CheckoutModeDetached,
+	}))
+}
 
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`^git@github\.com:(?P<repo>.+?)(?:\.git)?$`),
-		regexp.MustCompile(`^ssh://git@github\.com/(?P<repo>.+?)(?:\.git)?$`),
-		regexp.MustCompile(`^https://github\.com/(?P<repo>.+?)(?:\.git)?$`),
+func parseGitHubRepoFromRemoteURL(remoteURL string) string {
+	host, repo := parseRemoteRepoFromURL(remoteURL)
+	if !isGitHubRemoteHost(host) {
+		return ""
+	}
+	return repo
+}
+
+// parseRemoteRepoFromURL extracts host and owner/name from common git remote URL forms:
+//   - user@host:owner/repo.git
+//   - user@[ipv6]:owner/repo.git
+//   - ssh://git@host/owner/repo.git
+//   - https://host/owner/repo.git
+//   - http://host/owner/repo.git
+func parseRemoteRepoFromURL(remoteURL string) (host, repo string) {
+	remoteURL = strings.TrimSpace(remoteURL)
+	if remoteURL == "" {
+		return "", ""
 	}
 
-	for _, pattern := range patterns {
-		match := pattern.FindStringSubmatch(remoteURL)
-		if match == nil {
-			continue
+	if parsed, err := url.Parse(remoteURL); err == nil && parsed.Scheme != "" {
+		switch strings.ToLower(parsed.Scheme) {
+		case "ssh", "http", "https":
+			host = strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+			repo = strings.TrimSuffix(strings.Trim(strings.TrimSpace(parsed.Path), "/"), ".git")
+			if host != "" && isOwnerNameRepo(repo) {
+				return host, repo
+			}
 		}
-		index := pattern.SubexpIndex("repo")
-		if index > 0 {
-			return match[index]
-		}
+		return "", ""
 	}
 
-	return ""
+	pattern := regexp.MustCompile(`^(?:[^@/:]+@)?(?P<host>\[[^]]+\]|[^/:]+):(?P<repo>[^/]+/[^/]+?)(?:\.git)?/?$`)
+	match := pattern.FindStringSubmatch(remoteURL)
+	if match == nil {
+		return "", ""
+	}
+	host = strings.ToLower(strings.Trim(strings.TrimSpace(match[pattern.SubexpIndex("host")]), "[]"))
+	repo = strings.TrimSuffix(strings.TrimSpace(match[pattern.SubexpIndex("repo")]), ".git")
+	if host != "" && isOwnerNameRepo(repo) {
+		return host, repo
+	}
+	return "", ""
+}
+
+func isGitHubRemoteHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "github.com" || strings.HasSuffix(host, ".github.com")
+}
+
+func isOwnerNameRepo(repo string) bool {
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	return strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
 }
 
 func sanitizeBranchName(branch string) string {

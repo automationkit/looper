@@ -16,7 +16,10 @@ import (
 	"github.com/nexu-io/looper/internal/bootstrap"
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/forge"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/lifecycle"
@@ -90,12 +93,13 @@ type ListOpenPullRequestsInput struct {
 }
 
 type ListOpenIssuesInput struct {
-	Repo     string
-	CWD      string
-	Limit    int
-	Assignee string
-	Label    string
-	Labels   []string
+	IssueNumber int64
+	Repo        string
+	CWD         string
+	Limit       int
+	Assignee    string
+	Label       string
+	Labels      []string
 }
 
 type ViewIssueInput struct {
@@ -105,12 +109,14 @@ type ViewIssueInput struct {
 }
 
 type CreatePullRequestInput struct {
-	Repo       string
-	HeadBranch string
-	BaseBranch string
-	Title      string
-	Body       string
-	CWD        string
+	Repo            string
+	HeadBranch      string
+	BaseBranch      string
+	Title           string
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type CreatePullRequestResult struct {
@@ -130,6 +136,7 @@ type PullRequestDetail struct {
 	Body        string
 	URL         string
 	State       string
+	Labels      []string
 	HeadRefName string
 	BaseRefName string
 }
@@ -149,10 +156,12 @@ type PullRequestReviewersInput struct {
 }
 
 type UpdatePullRequestBodyInput struct {
-	Repo     string
-	PRNumber int64
-	Body     string
-	CWD      string
+	Repo            string
+	PRNumber        int64
+	Body            string
+	CWD             string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type IssueAssigneesInput struct {
@@ -215,10 +224,12 @@ type InspectHeadResult struct {
 }
 
 type CommitInput struct {
-	RepoPath     string
-	WorktreeRoot string
-	WorktreePath string
-	Message      string
+	RepoPath        string
+	WorktreeRoot    string
+	WorktreePath    string
+	Message         string
+	DisclosureAgent string
+	DisclosureModel string
 }
 
 type CommitResult struct{ CommitSHA string }
@@ -241,6 +252,11 @@ type AgentRunInput struct {
 	HeartbeatTimeout time.Duration
 	Metadata         map[string]any
 	IdempotencyKey   string
+	// UseSnapshot + SnapshotVendor/Model override the executor config for this
+	// start when the run has a durable agent snapshot (execution authority).
+	UseSnapshot    bool
+	SnapshotVendor string
+	SnapshotModel  *string
 }
 
 type AgentResult struct {
@@ -291,6 +307,7 @@ type Options struct {
 	AllowAutoPush           *bool
 	Disclosure              *config.DisclosureConfig
 	AgentRuntime            string
+	AgentProfileID          string
 	CustomInstructions      *config.Config
 	AgentModel              *string
 	RetryBaseDelay          time.Duration
@@ -321,9 +338,10 @@ type Runner struct {
 	allowAutoPush           bool
 	disclosure              config.DisclosureConfig
 	agentRuntime            string
+	agentProfileID          string
 	customInstructions      config.Config
 	projectRoleConfig       *config.Config
-	agentModel              string
+	agentModel              *string
 	retryBaseDelay          time.Duration
 	retryMaxAttempts        int64
 	onAgentExecutionStarted AgentExecutionStartedFunc
@@ -332,10 +350,12 @@ type Runner struct {
 }
 
 type DiscoveryInput struct {
-	ProjectID string
-	Repo      string
-	Limit     int
-	Snapshot  *githubinfra.DiscoverySnapshot
+	// IssueNumber targets a webhook issue without the polling list limit.
+	IssueNumber int64
+	ProjectID   string
+	Repo        string
+	Limit       int
+	Snapshot    *githubinfra.DiscoverySnapshot
 }
 
 type DiscoveryResult struct {
@@ -443,6 +463,10 @@ type loopError struct {
 	kind    QueueFailureKind
 }
 
+type holdSkipError struct{ summary string }
+
+func (e *holdSkipError) Error() string { return e.summary }
+
 func (e *loopError) Error() string { return e.message }
 
 type transientFailure interface{ Temporary() bool }
@@ -484,10 +508,15 @@ func New(options Options) *Runner {
 	if policy.LabelMode == "" {
 		policy = DiscoveryPolicy{AutoDiscovery: true, Labels: []string{discoveryLabel}, LabelMode: config.LabelModeAll, RequireAssigneeCurrentUser: true}
 	}
-	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: derefString(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
+	return &Runner{db: options.DB, repos: options.Repos, github: options.GitHub, git: options.Git, agentExecutor: options.AgentExecutor, logger: options.Logger, now: now, agentTimeout: agentTimeout, agentIdleTimeout: agentIdleTimeout, claimTTL: claimTTL, allowAutoPush: allowAutoPush, disclosure: disclosureCfg, agentRuntime: strings.TrimSpace(options.AgentRuntime), agentProfileID: strings.TrimSpace(options.AgentProfileID), customInstructions: customInstructionConfig(options.CustomInstructions), projectRoleConfig: options.CustomInstructions, agentModel: cloneStringPtr(options.AgentModel), retryBaseDelay: retryBaseDelay, retryMaxAttempts: retryMax, onAgentExecutionStarted: options.OnAgentExecutionStarted, onQueueItemEnqueued: options.OnQueueItemEnqueued, discoveryPolicy: policy}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	bound, bindErr := hostingidentity.Bind(ctx, r.customInstructions, input.ProjectID, "planner")
+	if bindErr != nil {
+		return DiscoveryResult{}, bindErr
+	}
+	ctx = bound
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if r.repos == nil || r.repos.Projects == nil || r.repos.Loops == nil || r.repos.Queue == nil || r.repos.Runs == nil {
 		return DiscoveryResult{}, fmt.Errorf("planner repositories are not configured")
@@ -522,12 +551,16 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 	if policy.RequireAssigneeCurrentUser {
 		assigneeFilter = login
 	}
-	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter}, policy)
+	issues, err := r.listOpenIssuesForDiscovery(ctx, ListOpenIssuesInput{Repo: input.Repo, CWD: project.RepoPath, Limit: input.Limit, Assignee: assigneeFilter, IssueNumber: input.IssueNumber}, policy)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 	result := DiscoveryResult{}
 	for _, issue := range issues {
+		if domain.IsAutoLaneHeld(domain.LoopTypePlanner, issue.Labels) {
+			result.Skipped++
+			continue
+		}
 		if !shouldClaimIssue(issue, login, policy) {
 			result.Skipped++
 			continue
@@ -540,7 +573,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		if loopResult.created {
 			result.CreatedLoopIDs = append(result.CreatedLoopIDs, loopResult.record.ID)
 		}
-		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" {
+		if loopResult.record.Status == "paused" || loopResult.record.Status == "completed" || loopResult.record.Status == "awaiting_human" {
 			result.Skipped++
 			continue
 		}
@@ -583,6 +616,11 @@ func (r *Runner) ProcessNext(ctx context.Context, claimedBy string) (*ProcessRes
 }
 
 func (r *Runner) ProcessClaimedQueueItem(ctx context.Context, queueItem storage.QueueItemRecord) (*ProcessResult, error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return nil, bindErr
+	}
+	ctx = bound
 	result, err := r.ProcessClaimedItem(ctx, queueItem)
 	if err != nil {
 		return r.recoverClaimedItem(ctx, queueItem, err)
@@ -630,6 +668,11 @@ func (r *Runner) reconcileRecoveredLoop(ctx context.Context, queueItem storage.Q
 }
 
 func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.QueueItemRecord) (ProcessResult, error) {
+	bound, bindErr := r.bindClaimedHostingIdentity(ctx, queueItem)
+	if bindErr != nil {
+		return ProcessResult{}, bindErr
+	}
+	ctx = bound
 	if queueItem.Type != "planner" {
 		return ProcessResult{}, fmt.Errorf("unsupported queue item type: %s", queueItem.Type)
 	}
@@ -656,6 +699,13 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 	}
 	run := resumedRun.Run
 	checkpoint := resumedRun.Checkpoint
+	if !plannerQueueItemIsManual(queueItem) {
+		if held, summary, err := r.plannerHoldSummary(ctx, *project, queueItem, *loop); err != nil {
+			return ProcessResult{}, err
+		} else if held {
+			return r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, summary)
+		}
+	}
 	claimedLockKey := ""
 	if resumedRun.StartStep != stepDiscoverIssues {
 		claimedLockKey = checkpoint.ClaimedLockKey
@@ -696,6 +746,10 @@ func (r *Runner) ProcessClaimedItem(ctx context.Context, queueItem storage.Queue
 		r.appendEvent(ctx, eventInput{eventType: "loop.step.started", projectID: loop.ProjectID, loopID: loop.ID, runID: run.ID, entityType: "run", entityID: run.ID, payload: map[string]any{"step": string(step)}})
 		checkpoint, err = r.executeStep(ctx, step, stepInput{Project: *project, Loop: *loop, Run: run, QueueItem: queueItem, Checkpoint: checkpoint})
 		if err != nil {
+			var holdErr *holdSkipError
+			if errors.As(err, &holdErr) {
+				return r.finishHeldPlannerQueueItem(ctx, *loop, &run, queueItem, checkpoint, holdErr.summary)
+			}
 			failure := r.classifyFailureWithBoundary(err, plannerFailureBoundaryForStep(step))
 			latest := r.getLatestCheckpoint(ctx, run, checkpoint)
 			latest.ResumePolicy = loops.NormalizeResumePolicy(string(failure.kind), latest.ResumePolicy)
@@ -808,7 +862,7 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		return input.Checkpoint, err
 	}
 	currentLogin := firstNonEmpty(normalizeLogin(stringFromAnyDefault(payload["currentUserLogin"])), input.CheckpointIssueLogin())
-	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), buildIssueLockKey(repo, issueNumber))
+	lockKey := firstNonEmpty(derefString(input.QueueItem.LockKey), storage.IssueLockKey(input.Project.ID, repo, issueNumber))
 	nowISO := r.nowISO()
 	reason := "planner-run"
 	acquired, err := r.repos.Locks.Acquire(ctx, storage.LockRecord{Key: lockKey, Owner: input.QueueItem.ID, Reason: &reason, ExpiresAt: eventlog.FormatJavaScriptISOString(r.now().Add(r.claimTTL)), CreatedAt: nowISO, UpdatedAt: nowISO})
@@ -854,7 +908,8 @@ func (r *Runner) runDiscoverIssueStep(ctx context.Context, input stepInput) (pla
 		releaseOnError = false
 		return checkpoint, nil
 	}
-	if manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) {
+	skipGitHubAppSelfAssign := providerKindForProject(r.customInstructions, input.Project.ID) == config.ProviderKindGitHub && hostingKindForContext(ctx) == config.HostingIdentityGitHubApp
+	if manual && currentLogin != "" && !includesLogin(detail.Assignees, currentLogin) && !skipGitHubAppSelfAssign && !strings.HasSuffix(currentLogin, "[bot]") {
 		if err := r.github.AddIssueAssignees(ctx, IssueAssigneesInput{Repo: repo, IssueNumber: issueNumber, Assignees: []string{currentLogin}, CWD: input.Project.RepoPath}); err != nil {
 			return input.Checkpoint, &loopError{message: fmt.Sprintf("Unable to assign issue %s#%d to %s: %v", repo, issueNumber, currentLogin, err), kind: FailureRetryableAfterResume}
 		}
@@ -956,12 +1011,29 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 	}
 	if !writeSpecCompleted {
 		executionID := eventlog.NewEventID("agent")
-		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, r.agentRuntime, r.agentModel)
+		agentVendor, agentModel, _, useSnapshot, err := r.identityFromRun(input.Run)
+		if err != nil {
+			return checkpoint, fmt.Errorf("resolve run agent identity: %w", err)
+		}
+		prompt, instructionBlock := buildPlannerPrompt(input.Project, r.customInstructions, issue, worktree, r.allowAutoPush, r.disclosure, agentVendor, derefString(agentModel), hostingKindForContext(ctx))
 		metadata := map[string]any{"loopType": "planner", "repo": issue.Repo, "issueNumber": issue.IssueNumber, "specPath": issue.SpecPath}
 		for key, value := range config.CustomInstructionMetadata(instructionBlock, prompt) {
 			metadata[key] = value
 		}
-		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID, Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout, Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID)})
+		if !plannerQueueItemIsManual(input.QueueItem) {
+			if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+				return checkpoint, err
+			} else if held {
+				return checkpoint, &holdSkipError{summary: summary}
+			}
+		}
+		useSnap, snapVendor, snapModel := agentRunSnapshotFields(agentVendor, agentModel, useSnapshot)
+		execution, err := r.agentExecutor.Start(ctx, AgentRunInput{
+			ExecutionID: executionID, ProjectID: input.Project.ID, LoopID: input.Loop.ID, RunID: input.Run.ID,
+			Prompt: prompt, WorkingDirectory: worktree.Path, Timeout: r.agentTimeout, HeartbeatTimeout: r.agentIdleTimeout,
+			Metadata: metadata, IdempotencyKey: fmt.Sprintf("planner:%s", input.Loop.ID),
+			UseSnapshot: useSnap, SnapshotVendor: snapVendor, SnapshotModel: snapModel,
+		})
 		if err != nil {
 			return checkpoint, err
 		}
@@ -987,6 +1059,13 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			}
 			return checkpoint, &loopError{message: message, kind: kind}
 		}
+		if !plannerQueueItemIsManual(input.QueueItem) {
+			if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+				return checkpoint, err
+			} else if held {
+				return checkpoint, &holdSkipError{summary: summary}
+			}
+		}
 		checkpoint.WriteSpec = checkpointWriteSpecFromAgentResult(result)
 		checkpoint.ensureLifecycle("planner", worktree.Branch, worktree.BaseBranch, true)
 		if result.Lifecycle != nil {
@@ -1006,7 +1085,8 @@ func (r *Runner) runWriteSpecStep(ctx context.Context, input stepInput) (planner
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if inspect.HasUncommittedChanges {
-			committed, err := r.git.Commit(ctx, CommitInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: buildPlannerFallbackCommitMessage(issue)})
+			disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+			committed, err := r.git.Commit(ctx, CommitInput{RepoPath: input.Project.RepoPath, WorktreeRoot: worktreeRoot, WorktreePath: worktree.Path, Message: buildPlannerFallbackCommitMessage(issue), DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 			if err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
@@ -1030,6 +1110,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	checkpoint := input.Checkpoint
 	if checkpoint.SkipReason != "" {
 		return checkpoint, nil
+	}
+	if plannerQueueItemIsManual(input.QueueItem) {
+		// Phase 2 applies only to automatic planner lanes.
+	} else if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
 	}
 	if !r.allowAutoPush {
 		message := fmt.Sprintf("Auto push disabled; manual publish required for planner %s", input.Loop.ID)
@@ -1070,6 +1157,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			return checkpoint, wrapRetryableAfterResume(err)
 		}
 	}
+	if plannerQueueItemIsManual(input.QueueItem) {
+		// Phase 2 applies only to automatic planner lanes.
+	} else if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
+	}
 	if checkpoint.Publish.PullRequest == nil {
 		if checkpoint.Lifecycle != nil && checkpoint.Lifecycle.PRNumber > 0 {
 			adopted, err := r.validatedLifecyclePullRequest(ctx, input, *issue, *worktree, checkpoint.Lifecycle)
@@ -1077,7 +1171,12 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			if adopted != nil {
-				if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, true); err != nil {
+				if held, summary, err := r.plannerAdoptionHoldSummary(ctx, input.Project, checkpoint, issue.Repo, adopted.Number, input.QueueItem); err != nil {
+					return checkpoint, err
+				} else if held {
+					return checkpoint, &holdSkipError{summary: summary}
+				}
+				if err := r.normalizePullRequestDisclosure(ctx, input.Run, issue.Repo, adopted.Number, input.Project.RepoPath, true); err != nil {
 					return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 				}
 				checkpoint.Publish.PullRequest = adopted
@@ -1105,7 +1204,12 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
 		if adopted != nil {
-			if err := r.normalizePullRequestDisclosure(ctx, issue.Repo, adopted.Number, input.Project.RepoPath, false); err != nil {
+			if held, summary, err := r.plannerAdoptionHoldSummary(ctx, input.Project, checkpoint, issue.Repo, adopted.Number, input.QueueItem); err != nil {
+				return checkpoint, err
+			} else if held {
+				return checkpoint, &holdSkipError{summary: summary}
+			}
+			if err := r.normalizePullRequestDisclosure(ctx, input.Run, issue.Repo, adopted.Number, input.Project.RepoPath, false); err != nil {
 				return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 			}
 			checkpoint.Publish.PullRequest = &checkpointPullRequest{Number: adopted.Number, URL: adopted.URL, Body: ""}
@@ -1124,7 +1228,8 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	}
 	if checkpoint.Publish.PullRequest == nil {
 		body := buildPullRequestBody(*issue, *worktree, checkpoint.WriteSpec)
-		pr, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{Repo: issue.Repo, HeadBranch: worktree.Branch, BaseBranch: worktree.BaseBranch, Title: "Spec: " + issue.Title, Body: body, CWD: input.Project.RepoPath})
+		disclosureAgent, disclosureModel := r.disclosureIdentity(input.Run)
+		pr, err := r.github.CreatePullRequest(ctx, CreatePullRequestInput{Repo: issue.Repo, HeadBranch: worktree.Branch, BaseBranch: worktree.BaseBranch, Title: "Spec: " + issue.Title, Body: body, CWD: input.Project.RepoPath, DisclosureAgent: disclosureAgent, DisclosureModel: disclosureModel})
 		if err != nil {
 			return checkpoint, &loopError{message: err.Error(), kind: FailureRetryableAfterResume}
 		}
@@ -1146,6 +1251,13 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	pr := checkpoint.Publish.PullRequest
 	if pr == nil || pr.Number == 0 {
 		return checkpoint, &loopError{message: "Planner publish requires a pull request number", kind: FailureRetryableAfterResume}
+	}
+	if plannerQueueItemIsManual(input.QueueItem) {
+		// Phase 2 applies only to automatic planner lanes.
+	} else if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, input.Project, checkpoint); err != nil {
+		return checkpoint, err
+	} else if held {
+		return checkpoint, &holdSkipError{summary: summary}
 	}
 	if !stringInSlice(specpr.ReviewingLabel, checkpoint.Publish.LabelsAdded) {
 		if err := r.github.AddPullRequestLabels(ctx, PullRequestLabelsInput{Repo: issue.Repo, PRNumber: pr.Number, Labels: []string{specpr.ReviewingLabel}, CWD: input.Project.RepoPath}); err != nil {
@@ -1173,6 +1285,104 @@ func (r *Runner) runPublishStep(ctx context.Context, input stepInput) (plannerCh
 	}
 	checkpoint.ResumePolicy = "advance_from_checkpoint"
 	return checkpoint, nil
+}
+
+func (r *Runner) plannerHoldSummary(ctx context.Context, project storage.ProjectRecord, queueItem storage.QueueItemRecord, loop storage.LoopRecord) (bool, string, error) {
+	if r.github == nil {
+		return false, "", nil
+	}
+	repo := firstNonEmpty(derefString(queueItem.Repo), derefString(loop.Repo))
+	issueNumber := parseIssueNumberFromTargetID(derefString(loop.TargetID))
+	if issueNumber == 0 {
+		issueNumber = parseIssueNumberFromTargetID(queueItem.TargetID)
+	}
+	if repo == "" || issueNumber == 0 {
+		return false, "", nil
+	}
+	detail, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: repo, IssueNumber: issueNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if !domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		return false, "", nil
+	}
+	return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, issueNumber), nil
+}
+
+func (r *Runner) plannerHoldSummaryForCheckpoint(ctx context.Context, project storage.ProjectRecord, checkpoint plannerCheckpoint) (bool, string, error) {
+	if r.github == nil {
+		return false, "", nil
+	}
+	if checkpoint.Issue == nil {
+		return false, "", nil
+	}
+	detail, err := r.github.ViewIssue(ctx, ViewIssueInput{Repo: checkpoint.Issue.Repo, IssueNumber: checkpoint.Issue.IssueNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Issue.IssueNumber), nil
+	}
+	if checkpoint.Publish == nil || checkpoint.Publish.PullRequest == nil || checkpoint.Publish.PullRequest.Number == 0 {
+		return false, "", nil
+	}
+	prDetail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: checkpoint.Issue.Repo, PRNumber: checkpoint.Publish.PullRequest.Number, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, prDetail.Labels) {
+		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", checkpoint.Issue.Repo, checkpoint.Publish.PullRequest.Number), nil
+	}
+	return false, "", nil
+}
+
+func (r *Runner) plannerAdoptedPullRequestHoldSummary(ctx context.Context, project storage.ProjectRecord, repo string, prNumber int64, queueItem storage.QueueItemRecord) (bool, string, error) {
+	if plannerQueueItemIsManual(queueItem) || r.github == nil || repo == "" || prNumber == 0 {
+		return false, "", nil
+	}
+	detail, err := r.github.ViewPullRequest(ctx, ViewPullRequestInput{Repo: repo, PRNumber: prNumber, CWD: project.RepoPath})
+	if err != nil {
+		return false, "", err
+	}
+	if domain.IsAutoLaneHeld(domain.LoopTypePlanner, detail.Labels) {
+		return true, fmt.Sprintf("Planner stopped because %s#%d is currently held", repo, prNumber), nil
+	}
+	return false, "", nil
+}
+
+func (r *Runner) plannerAdoptionHoldSummary(ctx context.Context, project storage.ProjectRecord, checkpoint plannerCheckpoint, repo string, prNumber int64, queueItem storage.QueueItemRecord) (bool, string, error) {
+	if plannerQueueItemIsManual(queueItem) {
+		return false, "", nil
+	}
+	if held, summary, err := r.plannerHoldSummaryForCheckpoint(ctx, project, checkpoint); err != nil || held {
+		return held, summary, err
+	}
+	return r.plannerAdoptedPullRequestHoldSummary(ctx, project, repo, prNumber, queueItem)
+}
+
+func (r *Runner) finishHeldPlannerQueueItem(ctx context.Context, loop storage.LoopRecord, run *storage.RunRecord, queueItem storage.QueueItemRecord, checkpoint plannerCheckpoint, summary string) (ProcessResult, error) {
+	checkpoint.SkipReason = summary
+	checkpoint.ResumePolicy = loops.ResumePolicyAdvanceFromCheckpoint
+	if run != nil {
+		if _, err := r.completeRun(ctx, *run, "success", summary, "", checkpoint); err != nil {
+			return ProcessResult{}, err
+		}
+	}
+	if err := r.repos.Queue.Complete(ctx, queueItem.ID, r.nowISO()); err != nil && !errors.Is(err, storage.ErrQueueItemNotActive) {
+		return ProcessResult{}, err
+	}
+	if _, err := r.updateLoop(ctx, loop, func(updated *storage.LoopRecord) {
+		updated.Status = "queued"
+		updated.LastRunAt = stringPtr(r.nowISO())
+		updated.NextRunAt = nil
+	}); err != nil {
+		return ProcessResult{}, err
+	}
+	result := ProcessResult{LoopID: loop.ID, QueueItemID: queueItem.ID, Status: "skipped", Summary: summary}
+	if run != nil {
+		result.RunID = run.ID
+	}
+	return result, nil
 }
 
 func plannerWorktreeRoot(project storage.ProjectRecord) (string, error) {
@@ -1233,7 +1443,7 @@ func (r *Runner) validatedLifecyclePullRequest(ctx context.Context, input stepIn
 	return &checkpointPullRequest{Number: prNumber, URL: firstNonEmpty(detail.URL, state.PRURL), Body: ""}, nil
 }
 
-func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string, prNumber int64, cwd string, force bool) error {
+func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, run storage.RunRecord, repo string, prNumber int64, cwd string, force bool) error {
 	if r.github == nil || prNumber <= 0 || !r.disclosure.Enabled || !r.disclosure.Channels.PullRequest {
 		return nil
 	}
@@ -1244,12 +1454,25 @@ func (r *Runner) normalizePullRequestDisclosure(ctx context.Context, repo string
 	if !force && !disclosure.HasMarkdownStamp(detail.Body) {
 		return nil
 	}
-	stamper := disclosure.Stamper{Config: r.disclosure, Agent: r.agentRuntime, Model: r.agentModel}
+	agent, model := r.disclosureIdentity(run)
+	stamper := disclosure.Stamper{Config: r.disclosure, Agent: agent, Model: model}
 	body := stamper.Markdown(detail.Body, "planner", disclosure.ChannelPullRequest)
 	if body == detail.Body {
 		return nil
 	}
-	return r.github.UpdatePullRequestBody(ctx, UpdatePullRequestBodyInput{Repo: repo, PRNumber: prNumber, Body: body, CWD: cwd})
+	return r.github.UpdatePullRequestBody(ctx, UpdatePullRequestBodyInput{Repo: repo, PRNumber: prNumber, Body: body, CWD: cwd, DisclosureAgent: agent, DisclosureModel: model})
+}
+
+// disclosureIdentity returns agent/model for disclosure stamps from the run
+// snapshot when present; falls back to runner identity on empty snapshot or
+// parse errors (stamp-only paths must not fail the run).
+func (r *Runner) disclosureIdentity(run storage.RunRecord) (agent, model string) {
+	vendor, modelPtr, _, _, err := config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		// Present but invalid snapshot must not fall back to live runner identity.
+		return "", ""
+	}
+	return vendor, derefString(modelPtr)
 }
 
 func (r *Runner) persistPlannerPullRequestReference(ctx context.Context, input stepInput, issue checkpointIssue, worktree checkpointWorktree, pr checkpointPullRequest) error {
@@ -1293,6 +1516,12 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	if err != nil {
 		return resumedRunContext{}, err
 	}
+	if latestRun != nil && latestRun.Status == "running" {
+		return resumedRunContext{}, &loopError{
+			message: fmt.Sprintf("loop %s already has a running planner run %s", loop.ID, latestRun.ID),
+			kind:    FailureRetryableTransient,
+		}
+	}
 	check := parseCheckpoint(nil)
 	lastCompleted := PlannerStep("")
 	if latestRun != nil {
@@ -1307,6 +1536,8 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 		}
 	}
 	resumed := shouldResume && startStep != stepDiscoverIssues
+	// stickySnapshot: any continuation of a failed/interrupted predecessor, including first-step retries.
+	stickySnapshot := latestRun != nil && (latestRun.Status == "failed" || latestRun.Status == "interrupted")
 	initialCheckpoint := plannerCheckpoint{ResumePolicy: "replay_step"}
 	if resumed {
 		initialCheckpoint = check
@@ -1314,12 +1545,32 @@ func (r *Runner) createRunContext(ctx context.Context, loop storage.LoopRecord) 
 	}
 	nowISO := r.nowISO()
 	run := storage.RunRecord{ID: eventlog.NewEventID("run"), LoopID: loop.ID, Status: "running", CurrentStep: stringPtr(string(startStep)), StartedAt: nowISO, LastHeartbeatAt: stringPtr(nowISO), CreatedAt: nowISO, UpdatedAt: nowISO}
+	snapshotJSON, err := r.agentSnapshotJSONForNewRun(latestRun, stickySnapshot)
+	if err != nil {
+		return resumedRunContext{}, err
+	}
+	if snapshotJSON == nil && strings.TrimSpace(r.agentRuntime) != "" {
+		return resumedRunContext{}, fmt.Errorf("agent snapshot required for vendor %q but was not produced", r.agentRuntime)
+	}
+	run.AgentSnapshotJSON = snapshotJSON
 	if resumed && lastCompleted != "" {
 		run.LastCompletedStep = stringPtr(string(lastCompleted))
 	}
 	encoded := mustMarshalJSON(initialCheckpoint)
 	run.CheckpointJSON = &encoded
 	if err := r.repos.Runs.Upsert(ctx, run); err != nil {
+		if hasRunning, checkErr := r.repos.Runs.HasRunningByLoopID(ctx, loop.ID); checkErr == nil && hasRunning {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running planner run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
+		if failureclass.IsOneRunningRunPerLoopViolation(err) {
+			return resumedRunContext{}, &loopError{
+				message: fmt.Sprintf("loop %s already has a running planner run", loop.ID),
+				kind:    FailureRetryableTransient,
+			}
+		}
 		return resumedRunContext{}, err
 	}
 	return resumedRunContext{Run: run, StartStep: startStep, Checkpoint: initialCheckpoint, Resumed: resumed}, nil
@@ -1430,7 +1681,7 @@ func (r *Runner) ensureLoopForIssue(ctx context.Context, project storage.Project
 	}
 	for _, existing := range existingLoops {
 		if existing.Type == "planner" && existing.ProjectID == project.ID && existing.TargetType == "issue" && derefString(existing.TargetID) == targetID {
-			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed"
+			pausedOrCompleted := existing.Status == "paused" || existing.Status == "completed" || existing.Status == "awaiting_human"
 			updated := existing
 			updated.Repo = stringPtr(repo)
 			suppressFailedRevival := loops.ShouldSuppressFailedRediscovery(existing.Status, loops.LastFailedDiscoveryFingerprint(existing.MetadataJSON), currentFingerprint)
@@ -1481,7 +1732,7 @@ func (r *Runner) enqueue(ctx context.Context, input enqueueInput) (storage.Queue
 	}
 	nowISO := r.nowISO()
 	targetID := buildIssueTargetID(input.Repo, input.IssueNumber)
-	lockKey := buildIssueLockKey(input.Repo, input.IssueNumber)
+	lockKey := storage.IssueLockKey(input.ProjectID, input.Repo, input.IssueNumber)
 	projectID := input.ProjectID
 	loopID := input.LoopID
 	payload := mustMarshalJSON(input.Payload)
@@ -1683,7 +1934,11 @@ func (c *plannerCheckpoint) ensureLifecycle(runner, branch, baseBranch string, e
 	}
 }
 
-func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string) (string, config.CustomInstructionBlock) {
+func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.Config, issue *checkpointIssue, worktree *checkpointWorktree, allowAutoPush bool, disclosureCfg config.DisclosureConfig, agentRuntime string, agentModel string, hostingKinds ...config.HostingIdentityKind) (string, config.CustomInstructionBlock) {
+	hostingKind := config.HostingIdentityKind("")
+	if len(hostingKinds) > 0 {
+		hostingKind = hostingKinds[0]
+	}
 	providerLabel := providerIssueSystemLabel(providerKindForProject(instructionConfig, project.ID))
 	parts := []string{
 		fmt.Sprintf("Write a planning spec for %s issue %s#%d.", providerLabel, issue.Repo, issue.IssueNumber),
@@ -1711,13 +1966,15 @@ func buildPlannerPrompt(project storage.ProjectRecord, instructionConfig config.
 		"- Use Markdown with clear problem, goals, approach, risks, and validation sections",
 		"- Keep the implementation scope aligned to the issue",
 	}
-	if allowAutoPush {
+	if allowAutoPush || hostingKind != "" {
 		requirements = append(requirements, "- Commit the spec changes on the current branch so the PR can be opened")
 	} else {
 		requirements = append(requirements, "- Do not push the branch or open/update pull requests; leave repository publishing for Looper/manual follow-up")
 	}
 	parts = append(parts, strings.Join(requirements, "\n"))
-	if allowAutoPush {
+	if hostingKind != "" {
+		parts = append(parts, forge.HostingAgentContext(hostingKind, "planner", issue.Repo, issue.IssueNumber), botPublicationPrompt())
+	} else if allowAutoPush {
 		parts = append(parts, lifecycle.PromptInstruction("planner", worktree.Branch, worktree.BaseBranch, true, true, disclosureCfg, agentRuntime, agentModel))
 	} else {
 		parts = append(parts, noRemoteLifecyclePromptInstruction("planner", worktree.Branch, worktree.BaseBranch, disclosureCfg, agentRuntime, agentModel))
@@ -1804,6 +2061,10 @@ func includesLogin(values []string, target string) bool {
 func isManualPlannerQueue(payload map[string]any) bool {
 	manual, ok := payload["manual"].(bool)
 	return ok && manual
+}
+
+func plannerQueueItemIsManual(queueItem storage.QueueItemRecord) bool {
+	return isManualPlannerQueue(parseJSONObject(queueItem.PayloadJSON))
 }
 
 func shouldClaimIssue(issue IssueSummary, login string, policy DiscoveryPolicy) bool {
@@ -2017,10 +2278,6 @@ func (r *Runner) stampFailedDiscoveryFingerprint(updated *storage.LoopRecord, qu
 func buildPlannerDedupeKey(projectID, loopID, repo string, issueNumber int64) string {
 	return fmt.Sprintf("planner:%s:%s:%s:%d", projectID, loopID, repo, issueNumber)
 }
-func buildIssueLockKey(repo string, issueNumber int64) string {
-	return fmt.Sprintf("issue:%s:%d", repo, issueNumber)
-}
-
 func parseIssueNumberFromTargetID(targetID string) int64 {
 	if targetID == "" {
 		return 0
@@ -2205,7 +2462,51 @@ func optionalString(value string) *string {
 	return &value
 }
 
+func (r *Runner) agentSnapshotJSONForNewRun(previous *storage.RunRecord, sticky bool) (*string, error) {
+	var previousSnapshot *string
+	if previous != nil {
+		previousSnapshot = previous.AgentSnapshotJSON
+	}
+	snapshotJSON, legacyResume, err := config.ResolveRunAgentSnapshotJSON(previousSnapshot, sticky, r.agentRuntime, r.agentModel, r.agentProfileID)
+	if err != nil {
+		return nil, err
+	}
+	if legacyResume && r.logger != nil && previous != nil {
+		r.logger.Warn("resuming run without agent_snapshot_json; using current runner agent identity", map[string]any{
+			"loopId": previous.LoopID,
+			"runId":  previous.ID,
+			"vendor": r.agentRuntime,
+			"model":  derefString(r.agentModel),
+		})
+	}
+	return snapshotJSON, nil
+}
+
+// identityFromRun returns the vendor/model/profile that must drive this run.
+// When the run has AgentSnapshotJSON, that identity is execution authority.
+// model is a pointer so nil (unset) and non-nil empty (suppress) stay distinct.
+func (r *Runner) identityFromRun(run storage.RunRecord) (vendor string, model *string, profile string, useSnapshot bool, err error) {
+	return config.IdentityFromRunSnapshot(run.AgentSnapshotJSON, r.agentRuntime, r.agentModel, r.agentProfileID)
+}
+
+func agentRunSnapshotFields(vendor string, model *string, useSnapshot bool) (bool, string, *string) {
+	if !useSnapshot {
+		return false, "", nil
+	}
+	// Pass through including non-nil empty suppress so SnapshotModel stays
+	// distinct from unset and ParamsForRoleVendor can strip params --model/-m.
+	return true, vendor, model
+}
+
 func stringPtr(value string) *string { return &value }
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
 
 func derefString(value *string) string {
 	if value == nil {

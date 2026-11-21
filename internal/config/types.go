@@ -7,6 +7,10 @@ const (
 	AgentVendorCodex      AgentVendor = "codex"
 	AgentVendorOpenCode   AgentVendor = "opencode"
 	AgentVendorCursorCLI  AgentVendor = "cursor-cli"
+	AgentVendorGrokBuild  AgentVendor = "grok-build"
+	AgentVendorPi         AgentVendor = "pi"
+	AgentVendorOmp        AgentVendor = "omp"
+	AgentVendorAgy        AgentVendor = "agy"
 )
 
 type LogLevel string
@@ -81,7 +85,8 @@ const (
 type ReviewerPublishMode string
 
 const (
-	ReviewerPublishModeSingleReview ReviewerPublishMode = "single_review"
+	ReviewerPublishModeSingleReview   ReviewerPublishMode = "single_review"
+	ReviewerPublishModeSummaryComment ReviewerPublishMode = "summary_comment"
 )
 
 type ReviewerThreadResolutionMode string
@@ -177,23 +182,62 @@ type ProviderKind string
 const (
 	ProviderKindGitHub  ProviderKind = "github"
 	ProviderKindForgejo ProviderKind = "forgejo"
+	// ProviderKindPlane is a task-source provider: issues (work-items) are read
+	// from a Plane project, while pull requests / diffs / reviews are delegated
+	// to the project's GitHub code repo. See internal/forge/plane.go.
+	ProviderKindPlane ProviderKind = "plane"
+)
+
+// ProviderAuthMode selects how a forgejo provider authenticates API calls.
+// token-env uses a native HTTP client with a token from the named environment
+// variable. tea reuses an explicitly selected tea CLI login as transport and
+// never extracts or stores the underlying token.
+type ProviderAuthMode string
+
+const (
+	ProviderAuthTokenEnv ProviderAuthMode = "token-env"
+	ProviderAuthTea      ProviderAuthMode = "tea"
 )
 
 type ProviderConfig struct {
-	ID       string       `json:"id"`
-	Kind     ProviderKind `json:"kind"`
-	BaseURL  string       `json:"baseUrl,omitempty"`
-	GHPath   *string      `json:"ghPath,omitempty"`
-	TokenEnv *string      `json:"tokenEnv,omitempty"`
+	ID       string           `json:"id"`
+	Kind     ProviderKind     `json:"kind"`
+	BaseURL  string           `json:"baseUrl,omitempty"`
+	GHPath   *string          `json:"ghPath,omitempty"`
+	Auth     ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv *string          `json:"tokenEnv,omitempty"`
+	// TeaLogin is the explicit tea CLI login name used when Auth is "tea".
+	// Required for tea-backed Forgejo providers; never inferred from tea's default.
+	TeaLogin *string `json:"teaLogin,omitempty"`
+	// TeaPath optionally overrides the tea executable path (otherwise PATH lookup).
+	TeaPath *string `json:"teaPath,omitempty"`
+	// Workspace and ProjectID identify the Plane project a plane provider reads
+	// its work-items from. Ignored for github/forgejo providers.
+	Workspace *string `json:"workspace,omitempty"`
+	ProjectID *string `json:"projectId,omitempty"`
+}
+
+// AgentBindingConfig is vendor+model only (profiles).
+type AgentBindingConfig struct {
+	Vendor *AgentVendor `json:"vendor,omitempty"`
+	Model  *string      `json:"model,omitempty"` // nil=inherit; non-nil empty=suppress model
+}
+
+// RoleAgentConfig is optional per-role overlay (planner/worker/reviewer/fixer only).
+type RoleAgentConfig struct {
+	Profile *string      `json:"profile,omitempty"`
+	Vendor  *AgentVendor `json:"vendor,omitempty"`
+	Model   *string      `json:"model,omitempty"`
 }
 
 type AgentConfig struct {
-	Vendor       *AgentVendor            `json:"vendor,omitempty"`
-	Model        *string                 `json:"model,omitempty"`
-	Params       map[string]any          `json:"params"`
-	Env          map[string]string       `json:"env"`
-	Timeouts     AgentTimeoutConfig      `json:"timeouts"`
-	NativeResume AgentNativeResumeConfig `json:"nativeResume"`
+	Vendor       *AgentVendor                  `json:"vendor,omitempty"`
+	Model        *string                       `json:"model,omitempty"`
+	Profiles     map[string]AgentBindingConfig `json:"profiles,omitempty"`
+	Params       map[string]any                `json:"params"`
+	Env          map[string]string             `json:"env"`
+	Timeouts     AgentTimeoutConfig            `json:"timeouts"`
+	NativeResume AgentNativeResumeConfig       `json:"nativeResume"`
 }
 
 type AgentNativeResumeConfig struct {
@@ -219,6 +263,7 @@ type AgentTimeoutConfig struct {
 type NotificationConfig struct {
 	InApp     bool                        `json:"inApp"`
 	Osascript OsascriptNotificationConfig `json:"osascript"`
+	Webhook   WebhookNotificationConfig   `json:"webhook"`
 }
 
 type DisclosureConfig struct {
@@ -249,6 +294,31 @@ type OsascriptNotificationConfig struct {
 	Enabled               bool                     `json:"enabled"`
 	SoundForLevels        []NotificationSoundLevel `json:"soundForLevels"`
 	ThrottleWindowSeconds int                      `json:"throttleWindowSeconds"`
+}
+
+type WebhookNotificationConfig struct {
+	Enabled               bool                     `json:"enabled"`
+	URLEnv                string                   `json:"urlEnv"`
+	Format                string                   `json:"format"`
+	Levels                []NotificationSoundLevel `json:"levels"`
+	ThrottleWindowSeconds int                      `json:"throttleWindowSeconds"`
+	// Mode selects the delivery transport: "webhook" (default; an incoming-webhook
+	// POST to URLEnv) or "app" (a Feishu app bot that posts an interactive card to
+	// ChatID via the IM API). App mode reads the app id/secret from AppIDEnv and
+	// AppSecretEnv — env var NAMES, never the secret values.
+	Mode         string `json:"mode,omitempty"`
+	AppIDEnv     string `json:"appIdEnv,omitempty"`
+	AppSecretEnv string `json:"appSecretEnv,omitempty"`
+	ChatID       string `json:"chatId,omitempty"`
+	// VerificationTokenEnv names the env var holding the Feishu app Verification
+	// Token. It gates the inbound HITL card-action callback (/hitl/feishu): the
+	// callback's envelope token must match, proving the request came from Feishu.
+	// A NAME, never the secret value — looper is open source.
+	VerificationTokenEnv string `json:"verificationTokenEnv,omitempty"`
+	// MentionOpenIds are Feishu open_ids to @-mention on messages that need a human
+	// (the mid-run ask, and failures), so follow-up items aren't missed in a busy
+	// group. Plain user ids, not secrets.
+	MentionOpenIds []string `json:"mentionOpenIds,omitempty"`
 }
 
 type LoggingConfig struct {
@@ -326,16 +396,26 @@ type ProjectNetworkConfig struct {
 	Mode NetworkMode `json:"mode,omitempty"`
 }
 
+type DefaultsLoopConfig struct {
+	// QuietPeriodSeconds is the shared default settle window for role loops.
+	// 0 disables quiet-period debounce. Role overrides win when set.
+	// Must be >= 0 and fit in time.Duration when converted from seconds.
+	// Design trade-off (failure prevented, costs, alternatives): see
+	// docs/configuration.md § Quiet-period debounce → Concept trade-off.
+	QuietPeriodSeconds int `json:"quietPeriodSeconds"`
+}
+
 type DefaultsConfig struct {
-	BaseBranch         string          `json:"baseBranch"`
-	AllowAutoCommit    bool            `json:"allowAutoCommit"`
-	AllowAutoPush      bool            `json:"allowAutoPush"`
-	AllowAutoApprove   bool            `json:"allowAutoApprove"`
-	AllowAutoMerge     bool            `json:"allowAutoMerge"`
-	AllowRiskyFixes    bool            `json:"allowRiskyFixes"`
-	FixAllPullRequests bool            `json:"fixAllPullRequests"`
-	OpenPRStrategy     OpenPRStrategy  `json:"openPrStrategy"`
-	AddSnapshotMode    AddSnapshotMode `json:"addSnapshotMode"`
+	BaseBranch         string             `json:"baseBranch"`
+	AllowAutoCommit    bool               `json:"allowAutoCommit"`
+	AllowAutoPush      bool               `json:"allowAutoPush"`
+	AllowAutoApprove   bool               `json:"allowAutoApprove"`
+	AllowAutoMerge     bool               `json:"allowAutoMerge"`
+	AllowRiskyFixes    bool               `json:"allowRiskyFixes"`
+	FixAllPullRequests bool               `json:"fixAllPullRequests"`
+	OpenPRStrategy     OpenPRStrategy     `json:"openPrStrategy"`
+	AddSnapshotMode    AddSnapshotMode    `json:"addSnapshotMode"`
+	Loop               DefaultsLoopConfig `json:"loop"`
 }
 
 type ReviewerLoopConfig struct {
@@ -350,17 +430,25 @@ type ReviewerLoopConfig struct {
 	StopOnApproved            bool `json:"stopOnApproved"`
 	StopOnReadyLabel          bool `json:"stopOnReadyLabel"`
 	StopOnIdenticalOutput     bool `json:"stopOnIdenticalOutput"`
+	// MaxPublishesPerPR caps successful reviewer publishes on one PR. 0 disables.
+	MaxPublishesPerPR int `json:"maxPublishesPerPR"`
 }
 
 type ReviewerConfig struct {
-	Loop                    ReviewerLoopConfig             `json:"loop"`
-	Retry                   ReviewerRetryConfig            `json:"retry"`
-	Scope                   ReviewerScope                  `json:"scope"`
-	PublishMode             ReviewerPublishMode            `json:"publishMode"`
-	ReviewEvents            ReviewerReviewEventsConfig     `json:"reviewEvents"`
-	DetectDuplicateFindings bool                           `json:"detectDuplicateFindings"`
-	NativeResume            ReviewerNativeResumeConfig     `json:"nativeResume"`
-	ThreadResolution        ReviewerThreadResolutionConfig `json:"threadResolution"`
+	Loop                    ReviewerLoopConfig              `json:"loop"`
+	Retry                   ReviewerRetryConfig             `json:"retry"`
+	Scope                   ReviewerScope                   `json:"scope"`
+	PublishMode             ReviewerPublishMode             `json:"publishMode"`
+	ReviewEvents            ReviewerReviewEventsConfig      `json:"reviewEvents"`
+	DetectDuplicateFindings bool                            `json:"detectDuplicateFindings"`
+	NativeResume            ReviewerNativeResumeConfig      `json:"nativeResume"`
+	ThreadResolution        ReviewerThreadResolutionConfig  `json:"threadResolution"`
+	RelatedFileGroups       ReviewerRelatedFileGroupsConfig `json:"relatedFileGroups"`
+}
+
+type ReviewerRelatedFileGroupsConfig struct {
+	Enabled         bool `json:"enabled"`
+	MinChangedFiles int  `json:"minChangedFiles"`
 }
 
 type ReviewerRetryConfig struct {
@@ -400,10 +488,36 @@ type ReviewerAutoMergeConfig struct {
 	Scope                   ReviewerAutoMergeScope    `json:"scope"`
 }
 
+type ReviewerSkillsMode string
+
+const (
+	ReviewerSkillsModeExtend  ReviewerSkillsMode = "extend"
+	ReviewerSkillsModeReplace ReviewerSkillsMode = "replace"
+)
+
+type ReviewerSkillsConfig struct {
+	Mode     ReviewerSkillsMode `json:"mode"`
+	Required []string           `json:"required"`
+	Optional []string           `json:"optional"`
+}
+
+type PartialReviewerSkillsConfig struct {
+	Mode     *ReviewerSkillsMode `json:"mode,omitempty"`
+	Required *[]string           `json:"required,omitempty"`
+	Optional *[]string           `json:"optional,omitempty"`
+}
+
 type IssueRoleTriggersConfig struct {
 	Labels                     []string  `json:"labels"`
 	LabelMode                  LabelMode `json:"labelMode"`
 	RequireAssigneeCurrentUser bool      `json:"requireAssigneeCurrentUser"`
+	// PlaneAssigneeID scopes discovery on a Plane task-source project to
+	// work-items assigned to this Plane member UUID. Plane assignees are UUIDs
+	// (not GitHub logins), so RequireAssigneeCurrentUser can't route them; set
+	// this per person instead so each looper only picks up its owner's items.
+	// Empty = label-only discovery (every watching looper sees every item).
+	// Ignored for non-Plane providers.
+	PlaneAssigneeID string `json:"planeAssigneeId,omitempty"`
 }
 
 type PullRequestRoleTriggersConfig struct {
@@ -428,6 +542,9 @@ type ReviewerRoleDiscoveryConfig struct {
 	AutoDiscovery bool                       `json:"autoDiscovery"`
 	Triggers      ReviewerRoleTriggersConfig `json:"triggers"`
 	SpecReview    ReviewerSpecReviewConfig   `json:"specReview"`
+	// FollowUpInterval is the minimum time between full follow-up sweeps for one
+	// project and repo, as a time.Duration string. Empty sweeps on every tick.
+	FollowUpInterval string `json:"followUpInterval,omitempty"`
 }
 
 type FixerRoleTriggersConfig struct {
@@ -438,28 +555,57 @@ type FixerRoleTriggersConfig struct {
 }
 
 type PlannerRoleConfig struct {
+	Identity      string                  `json:"identity,omitempty"`
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
 }
 
 type WorkerRoleConfig struct {
+	Identity      string                  `json:"identity,omitempty"`
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      IssueRoleTriggersConfig `json:"triggers"`
 	Instructions  string                  `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
+}
+
+// ReviewerNonoConfig is global operator policy, never a project-level override.
+type ReviewerNonoConfig struct {
+	Profile string `json:"profile"`
+	Command string `json:"command,omitempty"`
 }
 
 type ReviewerRoleConfig struct {
+	Nono         *ReviewerNonoConfig         `json:"nono,omitempty"`
+	Identity     string                      `json:"identity,omitempty"`
 	Discovery    ReviewerRoleDiscoveryConfig `json:"discovery"`
 	Behavior     ReviewerConfig              `json:"behavior"`
 	AutoMerge    ReviewerAutoMergeConfig     `json:"autoMerge"`
 	Instructions string                      `json:"instructions,omitempty"`
+	Skills       ReviewerSkillsConfig        `json:"skills"`
+	Agent        *RoleAgentConfig            `json:"agent,omitempty"`
+}
+
+type FixerLoopConfig struct {
+	// QuietPeriodSeconds delays fixer work after a new/changed fixable set.
+	// 0 disables quiet-period debounce (immediate enqueue). Default is 0.
+	QuietPeriodSeconds int `json:"quietPeriodSeconds"`
+	// MaxPushesPerPR caps successful fixer pushes on one PR. 0 disables.
+	MaxPushesPerPR int `json:"maxPushesPerPR"`
+}
+
+type FixerBehaviorConfig struct {
+	Loop FixerLoopConfig `json:"loop"`
 }
 
 type FixerRoleConfig struct {
+	Identity      string                  `json:"identity,omitempty"`
 	AutoDiscovery bool                    `json:"autoDiscovery"`
 	Triggers      FixerRoleTriggersConfig `json:"triggers"`
+	Behavior      FixerBehaviorConfig     `json:"behavior"`
 	Instructions  string                  `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig        `json:"agent,omitempty"`
 }
 
 type CoordinatorTriageDispositionConfig struct {
@@ -504,6 +650,7 @@ type CoordinatorMergeWatchConfig struct {
 }
 
 type CoordinatorRoleConfig struct {
+	Identity     string                        `json:"identity,omitempty"`
 	Enabled      bool                          `json:"enabled"`
 	PollInterval string                        `json:"pollInterval"`
 	Triage       CoordinatorTriageConfig       `json:"triage"`
@@ -521,6 +668,7 @@ type RoleConfigs struct {
 }
 
 type ProjectRefConfig struct {
+	Identity     string               `json:"identity,omitempty"`
 	ID           string               `json:"id"`
 	Name         string               `json:"name"`
 	Provider     string               `json:"provider,omitempty"`
@@ -539,6 +687,7 @@ type ProjectWebhookConfig struct {
 }
 
 type PartialProjectRefConfig struct {
+	Identity     *string                      `json:"identity,omitempty"`
 	ID           string                       `json:"id"`
 	Name         string                       `json:"name"`
 	Provider     *string                      `json:"provider,omitempty"`
@@ -562,14 +711,21 @@ type PartialProjectWebhookConfig struct {
 }
 
 type PartialProviderConfig struct {
-	ID       string        `json:"id"`
-	Kind     *ProviderKind `json:"kind,omitempty"`
-	BaseURL  *string       `json:"baseUrl,omitempty"`
-	GHPath   *string       `json:"ghPath,omitempty"`
-	TokenEnv *string       `json:"tokenEnv,omitempty"`
+	ID        string            `json:"id"`
+	Kind      *ProviderKind     `json:"kind,omitempty"`
+	BaseURL   *string           `json:"baseUrl,omitempty"`
+	GHPath    *string           `json:"ghPath,omitempty"`
+	Auth      *ProviderAuthMode `json:"auth,omitempty"`
+	TokenEnv  *string           `json:"tokenEnv,omitempty"`
+	TeaLogin  *string           `json:"teaLogin,omitempty"`
+	TeaPath   *string           `json:"teaPath,omitempty"`
+	Workspace *string           `json:"workspace,omitempty"`
+	ProjectID *string           `json:"projectId,omitempty"`
 }
 
 type Config struct {
+	Identities map[string]HostingIdentityConfig `json:"identities,omitempty"`
+
 	Server        ServerConfig       `json:"server"`
 	Storage       StorageConfig      `json:"storage"`
 	Scheduler     SchedulerConfig    `json:"scheduler"`
@@ -584,9 +740,53 @@ type Config struct {
 	Package       PackageConfig      `json:"package"`
 	Defaults      DefaultsConfig     `json:"defaults"`
 	Instructions  InstructionsConfig `json:"instructions"`
+	HITL          HITLConfig         `json:"hitl"`
 	Roles         RoleConfigs        `json:"roles"`
 	Providers     []ProviderConfig   `json:"providers,omitempty"`
 	Projects      []ProjectRefConfig `json:"projects"`
+}
+
+// HITLConfig gates the mid-run human-in-the-loop feature: when Enabled, agents
+// may pause mid-run to ask a human (by writing .looper/ask.json), the loop
+// suspends as awaiting_human, an ask-card is sent via the app-bot notifier, and
+// POST /api/v1/loops/{seq}/respond resumes the same agent session with the
+// answer. When Disabled (the default) every HITL code path is skipped and
+// runners behave exactly as before. It reuses the app-bot credentials in
+// notifications.webhook (appIdEnv/appSecretEnv/chatId) for send + listen.
+type HITLConfig struct {
+	Enabled bool `json:"enabled"`
+	// AnswerTransport selects how a mid-run question is delivered and how the
+	// human's answer comes back: "github" (PR comment, the zero-infra default),
+	// "feishu" (a team that lives in Feishu; needs the feishu transport), or
+	// "respond" (only the /respond API). Empty defaults to "github".
+	AnswerTransport string            `json:"answerTransport,omitempty"`
+	GitHub          *HITLGitHubConfig `json:"github,omitempty"`
+	Feishu          *HITLFeishuConfig `json:"feishu,omitempty"`
+}
+
+// HITLFeishuConfig tunes the Feishu HITL transport (answers come back via the
+// shared-app Cloudflare event inbox that the looper polls).
+type HITLFeishuConfig struct {
+	// Inbound selects how the answer reaches this looper: "cf-inbox" (poll the
+	// shared Cloudflare inbox) is the supported mode.
+	Inbound string `json:"inbound,omitempty"`
+	// EventInboxURLEnv names the env var holding the inbox poll URL
+	// (https://…/events). EventInboxTokenEnv names the env var holding the shared
+	// bearer token. Env var NAMES, never the values.
+	EventInboxURLEnv   string `json:"eventInboxUrlEnv,omitempty"`
+	EventInboxTokenEnv string `json:"eventInboxTokenEnv,omitempty"`
+}
+
+// HITLGitHubConfig tunes the GitHub PR-comment HITL transport.
+type HITLGitHubConfig struct {
+	// AwaitingLabel marks a PR whose loop is waiting on a human. Empty defaults to
+	// "looper:awaiting-human".
+	AwaitingLabel string `json:"awaitingLabel,omitempty"`
+	// MentionLogins are GitHub logins to /cc on an ask so a human is notified.
+	MentionLogins []string `json:"mentionLogins,omitempty"`
+	// AnswerAuthors, when non-empty, restricts who may answer to these logins.
+	// Empty means any non-bot commenter.
+	AnswerAuthors []string `json:"answerAuthors,omitempty"`
 }
 
 type PartialServerConfig struct {
@@ -623,6 +823,7 @@ type PartialWebhookConfig struct {
 type PartialAgentConfig struct {
 	Vendor       *AgentVendor                    `json:"vendor,omitempty"`
 	Model        *string                         `json:"model,omitempty"`
+	Profiles     map[string]AgentBindingConfig   `json:"profiles,omitempty"`
 	Params       map[string]any                  `json:"params,omitempty"`
 	Env          map[string]string               `json:"env,omitempty"`
 	Timeouts     *PartialAgentTimeoutConfig      `json:"timeouts,omitempty"`
@@ -652,6 +853,7 @@ type PartialAgentTimeoutConfig struct {
 type PartialNotificationConfig struct {
 	InApp     *bool                               `json:"inApp,omitempty"`
 	Osascript *PartialOsascriptNotificationConfig `json:"osascript,omitempty"`
+	Webhook   *PartialWebhookNotificationConfig   `json:"webhook,omitempty"`
 }
 
 type PartialDisclosureConfig struct {
@@ -673,6 +875,20 @@ type PartialOsascriptNotificationConfig struct {
 	Enabled               *bool                     `json:"enabled,omitempty"`
 	SoundForLevels        *[]NotificationSoundLevel `json:"soundForLevels,omitempty"`
 	ThrottleWindowSeconds *int                      `json:"throttleWindowSeconds,omitempty"`
+}
+
+type PartialWebhookNotificationConfig struct {
+	Enabled               *bool                     `json:"enabled,omitempty"`
+	URLEnv                *string                   `json:"urlEnv,omitempty"`
+	Format                *string                   `json:"format,omitempty"`
+	Levels                *[]NotificationSoundLevel `json:"levels,omitempty"`
+	ThrottleWindowSeconds *int                      `json:"throttleWindowSeconds,omitempty"`
+	Mode                  *string                   `json:"mode,omitempty"`
+	AppIDEnv              *string                   `json:"appIdEnv,omitempty"`
+	AppSecretEnv          *string                   `json:"appSecretEnv,omitempty"`
+	ChatID                *string                   `json:"chatId,omitempty"`
+	VerificationTokenEnv  *string                   `json:"verificationTokenEnv,omitempty"`
+	MentionOpenIds        *[]string                 `json:"mentionOpenIds,omitempty"`
 }
 
 type PartialLoggingConfig struct {
@@ -724,16 +940,21 @@ type PartialNetworkConfig struct {
 	GitHubUserID     *int64  `json:"githubUserId,omitempty"`
 }
 
+type PartialDefaultsLoopConfig struct {
+	QuietPeriodSeconds *int `json:"quietPeriodSeconds,omitempty"`
+}
+
 type PartialDefaultsConfig struct {
-	BaseBranch         *string          `json:"baseBranch,omitempty"`
-	AllowAutoCommit    *bool            `json:"allowAutoCommit,omitempty"`
-	AllowAutoPush      *bool            `json:"allowAutoPush,omitempty"`
-	AllowAutoApprove   *bool            `json:"allowAutoApprove,omitempty"`
-	AllowAutoMerge     *bool            `json:"allowAutoMerge,omitempty"`
-	AllowRiskyFixes    *bool            `json:"allowRiskyFixes,omitempty"`
-	FixAllPullRequests *bool            `json:"fixAllPullRequests,omitempty"`
-	OpenPRStrategy     *OpenPRStrategy  `json:"openPrStrategy,omitempty"`
-	AddSnapshotMode    *AddSnapshotMode `json:"addSnapshotMode,omitempty"`
+	BaseBranch         *string                    `json:"baseBranch,omitempty"`
+	AllowAutoCommit    *bool                      `json:"allowAutoCommit,omitempty"`
+	AllowAutoPush      *bool                      `json:"allowAutoPush,omitempty"`
+	AllowAutoApprove   *bool                      `json:"allowAutoApprove,omitempty"`
+	AllowAutoMerge     *bool                      `json:"allowAutoMerge,omitempty"`
+	AllowRiskyFixes    *bool                      `json:"allowRiskyFixes,omitempty"`
+	FixAllPullRequests *bool                      `json:"fixAllPullRequests,omitempty"`
+	OpenPRStrategy     *OpenPRStrategy            `json:"openPrStrategy,omitempty"`
+	AddSnapshotMode    *AddSnapshotMode           `json:"addSnapshotMode,omitempty"`
+	Loop               *PartialDefaultsLoopConfig `json:"loop,omitempty"`
 }
 
 type PartialReviewerLoopConfig struct {
@@ -748,18 +969,25 @@ type PartialReviewerLoopConfig struct {
 	StopOnApproved            *bool `json:"stopOnApproved,omitempty"`
 	StopOnReadyLabel          *bool `json:"stopOnReadyLabel,omitempty"`
 	StopOnIdenticalOutput     *bool `json:"stopOnIdenticalOutput,omitempty"`
+	MaxPublishesPerPR         *int  `json:"maxPublishesPerPR,omitempty"`
 }
 
 type PartialReviewerConfig struct {
-	Loop                    *PartialReviewerLoopConfig             `json:"loop,omitempty"`
-	Retry                   *PartialReviewerRetryConfig            `json:"retry,omitempty"`
-	Scope                   *ReviewerScope                         `json:"scope,omitempty"`
-	PublishMode             *ReviewerPublishMode                   `json:"publishMode,omitempty"`
-	ReviewEvents            *PartialReviewerReviewEventsConfig     `json:"reviewEvents,omitempty"`
-	DetectDuplicateFindings *bool                                  `json:"detectDuplicateFindings,omitempty"`
-	DedupeFindings          *bool                                  `json:"dedupeFindings,omitempty"`
-	NativeResume            *PartialReviewerNativeResumeConfig     `json:"nativeResume,omitempty"`
-	ThreadResolution        *PartialReviewerThreadResolutionConfig `json:"threadResolution,omitempty"`
+	Loop                    *PartialReviewerLoopConfig              `json:"loop,omitempty"`
+	Retry                   *PartialReviewerRetryConfig             `json:"retry,omitempty"`
+	Scope                   *ReviewerScope                          `json:"scope,omitempty"`
+	PublishMode             *ReviewerPublishMode                    `json:"publishMode,omitempty"`
+	ReviewEvents            *PartialReviewerReviewEventsConfig      `json:"reviewEvents,omitempty"`
+	DetectDuplicateFindings *bool                                   `json:"detectDuplicateFindings,omitempty"`
+	DedupeFindings          *bool                                   `json:"dedupeFindings,omitempty"`
+	NativeResume            *PartialReviewerNativeResumeConfig      `json:"nativeResume,omitempty"`
+	ThreadResolution        *PartialReviewerThreadResolutionConfig  `json:"threadResolution,omitempty"`
+	RelatedFileGroups       *PartialReviewerRelatedFileGroupsConfig `json:"relatedFileGroups,omitempty"`
+}
+
+type PartialReviewerRelatedFileGroupsConfig struct {
+	Enabled         *bool `json:"enabled,omitempty"`
+	MinChangedFiles *int  `json:"minChangedFiles,omitempty"`
 }
 
 type PartialReviewerRetryConfig struct {
@@ -804,10 +1032,30 @@ type PartialInstructionsConfig struct {
 	MaxBytes *int  `json:"maxBytes,omitempty"`
 }
 
+type PartialHITLConfig struct {
+	Enabled         *bool                    `json:"enabled,omitempty"`
+	AnswerTransport *string                  `json:"answerTransport,omitempty"`
+	GitHub          *PartialHITLGitHubConfig `json:"github,omitempty"`
+	Feishu          *PartialHITLFeishuConfig `json:"feishu,omitempty"`
+}
+
+type PartialHITLGitHubConfig struct {
+	AwaitingLabel *string   `json:"awaitingLabel,omitempty"`
+	MentionLogins *[]string `json:"mentionLogins,omitempty"`
+	AnswerAuthors *[]string `json:"answerAuthors,omitempty"`
+}
+
+type PartialHITLFeishuConfig struct {
+	Inbound            *string `json:"inbound,omitempty"`
+	EventInboxURLEnv   *string `json:"eventInboxUrlEnv,omitempty"`
+	EventInboxTokenEnv *string `json:"eventInboxTokenEnv,omitempty"`
+}
+
 type PartialIssueRoleTriggersConfig struct {
 	Labels                     *[]string  `json:"labels,omitempty"`
 	LabelMode                  *LabelMode `json:"labelMode,omitempty"`
 	RequireAssigneeCurrentUser *bool      `json:"requireAssigneeCurrentUser,omitempty"`
+	PlaneAssigneeID            *string    `json:"planeAssigneeId,omitempty"`
 }
 
 type PartialPullRequestRoleTriggersConfig struct {
@@ -829,9 +1077,10 @@ type PartialReviewerSpecReviewConfig struct {
 }
 
 type PartialReviewerRoleDiscoveryConfig struct {
-	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
-	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
-	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
+	AutoDiscovery    *bool                              `json:"autoDiscovery,omitempty"`
+	Triggers         *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
+	SpecReview       *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
+	FollowUpInterval *string                            `json:"followUpInterval,omitempty"`
 }
 
 type PartialFixerRoleTriggersConfig struct {
@@ -842,32 +1091,52 @@ type PartialFixerRoleTriggersConfig struct {
 }
 
 type PartialPlannerRoleConfig struct {
+	Identity      *string                         `json:"identity,omitempty"`
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
 }
 
 type PartialWorkerRoleConfig struct {
+	Identity      *string                         `json:"identity,omitempty"`
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialIssueRoleTriggersConfig `json:"triggers,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
 }
 
 type PartialReviewerRoleConfig struct {
+	Nono         *ReviewerNonoConfig                 `json:"nono,omitempty"`
+	Identity     *string                             `json:"identity,omitempty"`
 	Discovery    *PartialReviewerRoleDiscoveryConfig `json:"discovery,omitempty"`
 	Behavior     *PartialReviewerConfig              `json:"behavior,omitempty"`
 	AutoMerge    *PartialReviewerAutoMergeConfig     `json:"autoMerge,omitempty"`
 	Instructions *string                             `json:"instructions,omitempty"`
+	Skills       *PartialReviewerSkillsConfig        `json:"skills,omitempty"`
+	Agent        *RoleAgentConfig                    `json:"agent,omitempty"`
 
 	AutoDiscovery *bool                              `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialReviewerRoleTriggersConfig `json:"triggers,omitempty"`
 	SpecReview    *PartialReviewerSpecReviewConfig   `json:"specReview,omitempty"`
 }
 
+type PartialFixerLoopConfig struct {
+	QuietPeriodSeconds *int `json:"quietPeriodSeconds,omitempty"`
+	MaxPushesPerPR     *int `json:"maxPushesPerPR,omitempty"`
+}
+
+type PartialFixerBehaviorConfig struct {
+	Loop *PartialFixerLoopConfig `json:"loop,omitempty"`
+}
+
 type PartialFixerRoleConfig struct {
+	Identity      *string                         `json:"identity,omitempty"`
 	AutoDiscovery *bool                           `json:"autoDiscovery,omitempty"`
 	Triggers      *PartialFixerRoleTriggersConfig `json:"triggers,omitempty"`
+	Behavior      *PartialFixerBehaviorConfig     `json:"behavior,omitempty"`
 	Instructions  *string                         `json:"instructions,omitempty"`
+	Agent         *RoleAgentConfig                `json:"agent,omitempty"`
 }
 
 type PartialCoordinatorTriageDispositionConfig struct {
@@ -912,6 +1181,7 @@ type PartialCoordinatorMergeWatchConfig struct {
 }
 
 type PartialCoordinatorRoleConfig struct {
+	Identity     *string                               `json:"identity,omitempty"`
 	Enabled      *bool                                 `json:"enabled,omitempty"`
 	PollInterval *string                               `json:"pollInterval,omitempty"`
 	Triage       *PartialCoordinatorTriageConfig       `json:"triage,omitempty"`
@@ -931,6 +1201,8 @@ type PartialRoleConfigs struct {
 }
 
 type PartialConfig struct {
+	Identities *map[string]HostingIdentityConfig `json:"identities,omitempty"`
+
 	Server         *PartialServerConfig       `json:"server,omitempty"`
 	Storage        *PartialStorageConfig      `json:"storage,omitempty"`
 	Scheduler      *PartialSchedulerConfig    `json:"scheduler,omitempty"`
@@ -946,6 +1218,7 @@ type PartialConfig struct {
 	Defaults       *PartialDefaultsConfig     `json:"defaults,omitempty"`
 	LegacyReviewer *PartialReviewerConfig     `json:"reviewer,omitempty"`
 	Instructions   *PartialInstructionsConfig `json:"instructions,omitempty"`
+	HITL           *PartialHITLConfig         `json:"hitl,omitempty"`
 	Roles          *PartialRoleConfigs        `json:"roles,omitempty"`
 	Providers      *[]PartialProviderConfig   `json:"providers,omitempty"`
 	Projects       *[]PartialProjectRefConfig `json:"projects,omitempty"`

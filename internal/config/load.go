@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,7 +26,12 @@ type EnvLookupFunc func(string) (string, bool)
 type LoadFileMetadata struct {
 	ConfigPath        string
 	ConfigFilePresent bool
-	ToolDetection     map[string]ToolDetectionStatus
+	// ConfigFileRevision identifies the exact file generation decoded into this
+	// LoadedFileConfig. Keeping it beside the snapshot prevents a later read from
+	// pairing old effective values with a newer, not-yet-published file hash.
+	ConfigFileRevision string
+	ToolDetection      map[string]ToolDetectionStatus
+	FieldSources       map[string]ValueSource
 }
 
 type LoadedFileConfig struct {
@@ -37,12 +43,16 @@ type LoadedFileConfig struct {
 }
 
 type LoadFileOptions struct {
-	CWD               string
-	ConfigPath        string
-	DefaultConfigPath string
-	Args              []string
-	LookupEnv         EnvLookupFunc
-	LookPath          LookPathFunc
+	CWD        string
+	ConfigPath string
+	// ConfigPathOverride force-selects a file before --config and LOOPER_CONFIG
+	// path selection while retaining their ordinary value overrides. It is used
+	// to validate a temporary dashboard edit under the daemon's startup layers.
+	ConfigPathOverride string
+	DefaultConfigPath  string
+	Args               []string
+	LookupEnv          EnvLookupFunc
+	LookPath           LookPathFunc
 }
 
 type parsedCLIArgs struct {
@@ -80,7 +90,9 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}
 
 	configPath := ""
-	if parsedCLI.hasConfigPath {
+	if options.ConfigPathOverride != "" {
+		configPath = options.ConfigPathOverride
+	} else if parsedCLI.hasConfigPath {
 		configPath = parsedCLI.configPath
 	} else if envConfigPath, ok := lookupEnv("LOOPER_CONFIG"); ok && strings.TrimSpace(envConfigPath) != "" {
 		configPath = envConfigPath
@@ -99,7 +111,7 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 	}
 
 	resolvedConfigPath := ResolveConfigPath(configPath, cwd)
-	partialConfig, present, err := readConfigFile(resolvedConfigPath)
+	partialConfig, present, revision, err := readConfigFileGeneration(resolvedConfigPath)
 	if err != nil {
 		return LoadedFileConfig{}, err
 	}
@@ -142,9 +154,11 @@ func LoadFile(options LoadFileOptions) (LoadedFileConfig, error) {
 		Warnings: dedupeWarnings(fileWarnings, envWarnings, cliWarnings),
 		Notices:  fileNotices,
 		Metadata: LoadFileMetadata{
-			ConfigPath:        resolvedConfigPath,
-			ConfigFilePresent: present,
-			ToolDetection:     toolDetection.Detection,
+			ConfigPath:         resolvedConfigPath,
+			ConfigFilePresent:  present,
+			ConfigFileRevision: revision,
+			ToolDetection:      toolDetection.Detection,
+			FieldSources:       discoverFieldSources(config, partialConfig, envOverrides, parsedCLI.overrides),
 		},
 	}, nil
 }
@@ -266,25 +280,45 @@ func applyGlobalReviewerEnableSelfReviewOverride(config *Config, partial Partial
 }
 
 func readConfigFile(path string) (PartialConfig, bool, error) {
+	partial, present, _, err := readConfigFileGeneration(path)
+	return partial, present, err
+}
+
+func readConfigFileGeneration(path string) (PartialConfig, bool, string, error) {
 	if err := validateConfigFileSuffix(path); err != nil {
-		return PartialConfig{}, false, err
+		return PartialConfig{}, false, "", err
 	}
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return PartialConfig{}, false, nil
+			return PartialConfig{}, false, ConfigFileRevision(nil, false), nil
 		}
 
-		return PartialConfig{}, false, fmt.Errorf("failed to read config file at %s: %w", path, err)
+		return PartialConfig{}, false, "", fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
+	revision := ConfigFileRevision(raw, true)
 
 	partialConfig, err := decodeConfigFile(path, raw)
 	if err != nil {
-		return PartialConfig{}, true, fmt.Errorf("failed to read config file at %s: %w", path, err)
+		return PartialConfig{}, true, revision, fmt.Errorf("failed to read config file at %s: %w", path, err)
 	}
 
-	return partialConfig, true, nil
+	return partialConfig, true, revision, nil
+}
+
+// ConfigFileRevision returns the equality token used by dashboard reads and
+// patches. File presence is part of the token, so an absent file and an empty
+// file are distinct generations.
+func ConfigFileRevision(raw []byte, present bool) string {
+	marker := "missing\x00"
+	if present {
+		marker = "present\x00"
+	}
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte(marker))
+	_, _ = hasher.Write(raw)
+	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
 }
 
 func validateConfigFileSuffix(path string) error {
@@ -389,11 +423,17 @@ func decodeTopLevelConfigSections(decoder *json.Decoder, partialConfig *PartialC
 		{key: "instructions", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "instructions", &partialConfig.Instructions)
 		}},
+		{key: "hitl", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "hitl", &partialConfig.HITL)
+		}},
 		{key: "roles", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "roles", &partialConfig.Roles)
 		}},
 		{key: "providers", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "providers", &partialConfig.Providers)
+		}},
+		{key: "identities", decode: func(raw json.RawMessage) error {
+			return decodeTopLevelConfigSection(raw, "identities", &partialConfig.Identities)
 		}},
 		{key: "projects", decode: func(raw json.RawMessage) error {
 			return decodeTopLevelConfigSection(raw, "projects", &partialConfig.Projects)
@@ -857,6 +897,28 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).QuietPeriodSeconds = parsedValue
 			index = nextIndex
+		case matchesFlag(arg, "--defaults-loop-quiet-period-seconds"):
+			value, nextIndex, err := takeValue(index, "--defaults-loop-quiet-period-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --defaults-loop-quiet-period-seconds: %q is not an integer", value)
+			}
+			ensureDefaultsLoopConfig(&parsed.overrides).QuietPeriodSeconds = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--roles-fixer-behavior-loop-quiet-period-seconds"):
+			value, nextIndex, err := takeValue(index, "--roles-fixer-behavior-loop-quiet-period-seconds")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-fixer-behavior-loop-quiet-period-seconds: %q is not an integer", value)
+			}
+			ensureFixerLoopConfig(&parsed.overrides).QuietPeriodSeconds = parsedValue
+			index = nextIndex
 		case matchesAnyFlag(arg, "--roles-reviewer-behavior-loop-min-publish-interval-seconds", "--reviewer-min-publish-interval-seconds"):
 			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-min-publish-interval-seconds")
 			if err != nil {
@@ -867,6 +929,28 @@ func parseCLIArgs(args []string) (parsedCLIArgs, error) {
 				return parsedCLIArgs{}, fmt.Errorf("invalid value for --reviewer-min-publish-interval-seconds: %q is not an integer", value)
 			}
 			ensureReviewerLoopConfig(&parsed.overrides).MinPublishIntervalSeconds = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--roles-reviewer-behavior-loop-max-publishes-per-pr"):
+			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-max-publishes-per-pr")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-reviewer-behavior-loop-max-publishes-per-pr: %q is not an integer", value)
+			}
+			ensureReviewerLoopConfig(&parsed.overrides).MaxPublishesPerPR = parsedValue
+			index = nextIndex
+		case matchesFlag(arg, "--roles-fixer-behavior-loop-max-pushes-per-pr"):
+			value, nextIndex, err := takeValue(index, "--roles-fixer-behavior-loop-max-pushes-per-pr")
+			if err != nil {
+				return parsedCLIArgs{}, err
+			}
+			parsedValue, err := parseInteger(value)
+			if err != nil {
+				return parsedCLIArgs{}, fmt.Errorf("invalid value for --roles-fixer-behavior-loop-max-pushes-per-pr: %q is not an integer", value)
+			}
+			ensureFixerLoopConfig(&parsed.overrides).MaxPushesPerPR = parsedValue
 			index = nextIndex
 		case matchesAnyFlag(arg, "--roles-reviewer-behavior-loop-max-iterations-per-pr", "--reviewer-max-iterations-per-pr"):
 			value, nextIndex, err := takeValue(index, "--roles-reviewer-behavior-loop-max-iterations-per-pr")
@@ -1149,12 +1233,40 @@ func buildEnvOverrides(lookupEnv EnvLookupFunc) (PartialConfig, error) {
 		}
 		ensureReviewerLoopConfig(&overrides).QuietPeriodSeconds = parsed
 	}
+	if value, ok := lookupEnv("LOOPER_DEFAULTS_LOOP_QUIET_PERIOD_SECONDS"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_DEFAULTS_LOOP_QUIET_PERIOD_SECONDS: %q is not an integer", value)
+		}
+		ensureDefaultsLoopConfig(&overrides).QuietPeriodSeconds = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_QUIET_PERIOD_SECONDS: %q is not an integer", value)
+		}
+		ensureFixerLoopConfig(&overrides).QuietPeriodSeconds = parsed
+	}
 	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MIN_PUBLISH_INTERVAL_SECONDS", "LOOPER_REVIEWER_MIN_PUBLISH_INTERVAL_SECONDS"); ok {
 		parsed, err := parseInteger(value)
 		if err != nil {
 			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MIN_PUBLISH_INTERVAL_SECONDS: %q is not an integer", value)
 		}
 		ensureReviewerLoopConfig(&overrides).MinPublishIntervalSeconds = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_PUBLISHES_PER_PR"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_PUBLISHES_PER_PR: %q is not an integer", value)
+		}
+		ensureReviewerLoopConfig(&overrides).MaxPublishesPerPR = parsed
+	}
+	if value, ok := lookupEnv("LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_MAX_PUSHES_PER_PR"); ok {
+		parsed, err := parseInteger(value)
+		if err != nil {
+			return PartialConfig{}, fmt.Errorf("invalid value for LOOPER_ROLES_FIXER_BEHAVIOR_LOOP_MAX_PUSHES_PER_PR: %q is not an integer", value)
+		}
+		ensureFixerLoopConfig(&overrides).MaxPushesPerPR = parsed
 	}
 	if value, ok := envValue("LOOPER_ROLES_REVIEWER_BEHAVIOR_LOOP_MAX_ITERATIONS_PER_PR", "LOOPER_REVIEWER_MAX_ITERATIONS_PER_PR"); ok {
 		parsed, err := parseInteger(value)
@@ -1415,6 +1527,9 @@ func applyRoleEnvOverrides(overrides *PartialConfig, lookupEnv EnvLookupFunc) er
 	if value, ok := envValue("LOOPER_ROLES_REVIEWER_DISCOVERY_SPEC_REVIEW_REVIEWING_LABEL", "LOOPER_ROLES_REVIEWER_SPEC_REVIEW_REVIEWING_LABEL"); ok {
 		ensureReviewerSpecReviewConfig(overrides).ReviewingLabel = stringPtr(strings.TrimSpace(value))
 	}
+	if value, ok := envValue("LOOPER_ROLES_REVIEWER_DISCOVERY_FOLLOW_UP_INTERVAL"); ok {
+		ensureReviewerRoleDiscoveryConfig(overrides).FollowUpInterval = stringPtr(strings.TrimSpace(value))
+	}
 
 	if err := boolEnv("LOOPER_ROLES_FIXER_AUTO_DISCOVERY", func(v *bool) { ensureFixerRoleConfig(overrides).AutoDiscovery = v }); err != nil {
 		return err
@@ -1529,6 +1644,14 @@ func ensureDefaultsConfig(partial *PartialConfig) *PartialDefaultsConfig {
 	return partial.Defaults
 }
 
+func ensureDefaultsLoopConfig(partial *PartialConfig) *PartialDefaultsLoopConfig {
+	defaults := ensureDefaultsConfig(partial)
+	if defaults.Loop == nil {
+		defaults.Loop = &PartialDefaultsLoopConfig{}
+	}
+	return defaults.Loop
+}
+
 func ensureReviewerConfig(partial *PartialConfig) *PartialReviewerConfig {
 	reviewer := ensureReviewerRoleConfig(partial)
 	if reviewer.Behavior == nil {
@@ -1633,6 +1756,14 @@ func ensureReviewerRoleTriggersConfig(partial *PartialConfig) *PartialReviewerRo
 	return reviewer.Triggers
 }
 
+func ensureReviewerRoleDiscoveryConfig(partial *PartialConfig) *PartialReviewerRoleDiscoveryConfig {
+	reviewer := ensureReviewerRoleConfig(partial)
+	if reviewer.Discovery == nil {
+		reviewer.Discovery = &PartialReviewerRoleDiscoveryConfig{}
+	}
+	return reviewer.Discovery
+}
+
 func ensureReviewerSpecReviewConfig(partial *PartialConfig) *PartialReviewerSpecReviewConfig {
 	reviewer := ensureReviewerRoleConfig(partial)
 	if reviewer.SpecReview == nil {
@@ -1655,4 +1786,20 @@ func ensureFixerRoleTriggersConfig(partial *PartialConfig) *PartialFixerRoleTrig
 		fixer.Triggers = &PartialFixerRoleTriggersConfig{}
 	}
 	return fixer.Triggers
+}
+
+func ensureFixerBehaviorConfig(partial *PartialConfig) *PartialFixerBehaviorConfig {
+	fixer := ensureFixerRoleConfig(partial)
+	if fixer.Behavior == nil {
+		fixer.Behavior = &PartialFixerBehaviorConfig{}
+	}
+	return fixer.Behavior
+}
+
+func ensureFixerLoopConfig(partial *PartialConfig) *PartialFixerLoopConfig {
+	behavior := ensureFixerBehaviorConfig(partial)
+	if behavior.Loop == nil {
+		behavior.Loop = &PartialFixerLoopConfig{}
+	}
+	return behavior.Loop
 }

@@ -2,38 +2,63 @@ package shell
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/nexu-io/looper/internal/processcontainment"
 )
 
 const (
 	defaultMaxOutputBytes = 256 * 1024
 	defaultGracefulStop   = 5 * time.Second
+	// startAttempts covers transient Linux ETXTBSY after a binary/script is
+	// installed (common when tests write a fake tool then exec it immediately).
+	startAttempts      = 8
+	startRetryBaseWait = 5 * time.Millisecond
+	// drainSlack is added to GracefulShutdown when building containment
+	// DrainTimeout so TERM grace plus descendant cleanup fit the budget.
+	drainSlack = 15 * time.Second
 )
 
 type Result struct {
-	ExitCode   int
-	Stdout     string
-	Stderr     string
-	Duration   time.Duration
-	DurationMS int64
+	ExitCode        int
+	Stdout          string
+	Stderr          string
+	StdoutTruncated bool
+	StderrTruncated bool
+	Duration        time.Duration
+	DurationMS      int64
 }
 
 type Options struct {
-	Command          string
-	Args             []string
-	CWD              string
+	Command string
+	Args    []string
+	CWD     string
+	// Env replaces the child environment when non-nil, including an empty
+	// map. Nil retains the legacy behavior of inheriting the daemon environment.
 	Env              map[string]string
 	Stdin            string
 	Timeout          time.Duration
 	GracefulShutdown time.Duration
 	MaxCapturedBytes int
+	// Tracker registers the live containment handle with the Execution
+	// Supervisor for shutdown drain / retain-storage (ADR-0015 / #577).
+	// Set only for Supervisor-owned paths (worker/fixer validation). Leave nil
+	// for independently lifecycle-owned gateways (git/gh/tea, osascript).
+	Tracker processcontainment.LiveTracker
+	// StartGate, when set, wraps each cmd.Start attempt so callers can hold
+	// an external critical section (e.g. admission.mu) across process Start
+	// only. Retry waits and Wait/Drain stay outside the gate so long-running
+	// commands do not block concurrent close/cancel. The gate must call start
+	// at most once per invocation; if it returns without calling start, Run
+	// treats that as a refused start (no process launched).
+	StartGate func(start func() error) error
 }
 
 type CommandExecutionError struct {
@@ -43,6 +68,83 @@ type CommandExecutionError struct {
 
 func (e *CommandExecutionError) Error() string { return e.Message }
 
+// IsStartFailure reports whether err is a process-launch failure from Run
+// (missing executable, inaccessible CWD, fork/exec failure). These occur
+// before any command output and are local environment problems, not remote
+// command or API results.
+//
+// Trade-off (string-marker classification):
+//   - Prevents: local CLI launch failures (missing/moved gh, bad CWD) being
+//     tagged BoundaryGitHubAPI and retried forever on unlimited fixer queues.
+//   - Cost: couples classification to Run's stable "start command:" prefix.
+//     False positives require an unrelated error whose text contains that
+//     exact marker; false negatives occur if a wrapper rewrites Error() and
+//     drops both the prefix and the unwrap chain (mitigated by walking Unwrap
+//     then falling back to a full-message contains check).
+//   - Why not a typed StartError only: Run already emits the prefix via
+//     fmt.Errorf("start command: %w", err) for diagnostics and other
+//     string-based local-path classifiers. A parallel typed error would
+//     duplicate the launch contract and force every wrap site to remember
+//     both forms. The marker is the existing authority for "failed before
+//     any command output"; this helper only exposes it.
+//   - Why not trust gateway/API error shape alone: gh CLI launch failures
+//     surface as plain exec errors before any hosting response exists.
+//
+// Callers that park failures as non-retryable config must also check
+// IsTransientStartFailure: host-pressure launch errors share the same
+// "start command:" marker but should remain retryable.
+func IsStartFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Walk the unwrap chain so wrappers that preserve Error() semantics still
+	// match. errors.Join does not unwrap linearly, so also check the full
+	// message once for the stable launch marker.
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if strings.HasPrefix(e.Error(), "start command:") {
+			return true
+		}
+	}
+	return strings.Contains(err.Error(), "start command:")
+}
+
+// IsTransientStartFailure reports whether err is a process-launch failure
+// caused by temporary host pressure rather than deterministic local config.
+//
+// Covered errno values (after Run's short local ETXTBSY retry is exhausted):
+//   - EAGAIN / EWOULDBLOCK: process table or resource temporarily unavailable
+//   - ENOMEM: cannot allocate memory for the new process
+//   - ETXTBSY: text file busy (binary/script still open for write)
+//   - EMFILE: process file-descriptor table temporarily exhausted
+//   - ENFILE: system-wide file-descriptor table temporarily exhausted
+//
+// These still match IsStartFailure (same "start command:" marker) but a later
+// launch may succeed, so classifiers must not park them as BoundaryConfig.
+func IsTransientStartFailure(err error) bool {
+	if !IsStartFailure(err) {
+		return false
+	}
+	return isTransientStartErrno(err)
+}
+
+func isTransientStartErrno(err error) bool {
+	if err == nil {
+		return false
+	}
+	// EWOULDBLOCK is often identical to EAGAIN; check both for portability.
+	return errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EWOULDBLOCK) ||
+		errors.Is(err, syscall.ENOMEM) ||
+		errors.Is(err, syscall.ETXTBSY) ||
+		errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE)
+}
+
+// Run starts a command under process containment (ADR-0015 / #577).
+//
+// The spawn boundary is Configure + Start + Bind. Cancel and timeout use
+// Handle.Kill (confirmed drain), not raw PID signal-only success. Normal exit
+// still Drain so background process-group descendants cannot outlive Run.
 func Run(ctx context.Context, options Options) (Result, error) {
 	if strings.TrimSpace(options.Command) == "" {
 		return Result{}, fmt.Errorf("command is required")
@@ -58,103 +160,302 @@ func Run(ctx context.Context, options Options) (Result, error) {
 		gracefulShutdown = defaultGracefulStop
 	}
 
-	cmd := exec.Command(options.Command, options.Args...)
-	cmd.Dir = options.CWD
-	if len(options.Env) > 0 {
-		cmd.Env = envSlice(options.Env)
-	}
-	if options.Stdin != "" {
-		cmd.Stdin = strings.NewReader(options.Stdin)
-	}
-
 	stdoutBuffer := newBoundedBuffer(maxCapturedBytes)
 	stderrBuffer := newBoundedBuffer(maxCapturedBytes)
-	cmd.Stdout = stdoutBuffer
-	cmd.Stderr = stderrBuffer
 
-	if err := cmd.Start(); err != nil {
+	// BeginTrack before Start so BeginShutdown waits across the Start→Track
+	// window (and Track refuse-kills if admission closed mid-start).
+	var endTrack func()
+	if options.Tracker != nil {
+		end, trackErr := options.Tracker.BeginTrack()
+		if trackErr != nil {
+			return Result{}, fmt.Errorf("start command: %w", trackErr)
+		}
+		endTrack = end
+	}
+	handle, err := startContainedCommand(ctx, options, gracefulShutdown, stdoutBuffer, stderrBuffer)
+	if err != nil {
+		if endTrack != nil {
+			endTrack()
+		}
 		return Result{}, fmt.Errorf("start command: %w", err)
 	}
-
-	waitCh := make(chan error, 1)
-	go func() {
-		waitCh <- cmd.Wait()
-	}()
-
-	var (
-		waitErr          error
-		timedOut         bool
-		canceledErr      error
-		terminationStart <-chan time.Time
-		killAt           <-chan time.Time
-		terminateOnce    sync.Once
-	)
-
-	terminate := func() {
-		terminateOnce.Do(func() {
-			if cmd.Process == nil {
-				return
-			}
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !isProcessDone(err) {
-				_ = cmd.Process.Kill()
-				return
-			}
-			if gracefulShutdown <= 0 {
-				_ = cmd.Process.Kill()
-				return
-			}
-			killAt = time.After(gracefulShutdown)
-		})
-	}
-
-	if options.Timeout > 0 {
-		terminationStart = time.After(options.Timeout)
-	}
-
-	waiting := true
-	for waiting {
-		select {
-		case waitErr = <-waitCh:
-			waiting = false
-		case <-terminationStart:
-			timedOut = true
-			terminationStart = nil
-			terminate()
-		case <-killAt:
-			killAt = nil
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		case <-ctx.Done():
-			if canceledErr == nil {
-				canceledErr = ctx.Err()
-				terminate()
-			}
+	if options.Tracker != nil {
+		release := options.Tracker.Track(handle)
+		if endTrack != nil {
+			endTrack()
+		}
+		if release != nil {
+			defer release()
 		}
 	}
 
+	waitCtx := ctx
+	var timeoutCancel context.CancelFunc
+	if options.Timeout > 0 {
+		waitCtx, timeoutCancel = context.WithTimeout(ctx, options.Timeout)
+		defer timeoutCancel()
+	}
+
+	// Wait in a goroutine so we can Drain when the leader is reaped but
+	// cmd.Wait is still blocked on stdout/stderr copy (background child still
+	// holds the writer ends). Blocking only on Wait never reaches Drain.
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- handle.Wait(waitCtx) }()
+
+	waitErr, timedOut, canceledErr, killErr, drainErr := awaitContainedCommand(
+		handle, waitCtx, ctx, options.Timeout > 0, gracefulShutdown, waitDone,
+	)
+	// Surface containment failures to the Supervisor for retain-storage even
+	// when callers (e.g. validation) collapse Run errors into a failed result.
+	reportContainmentFailure(options.Tracker, killErr, drainErr)
+
 	duration := time.Since(startedAt)
 	result := Result{
-		ExitCode:   exitCode(cmd),
-		Stdout:     stdoutBuffer.String(),
-		Stderr:     stderrBuffer.String(),
-		Duration:   duration,
-		DurationMS: duration.Milliseconds(),
+		ExitCode:        exitCode(handle),
+		Stdout:          stdoutBuffer.String(),
+		Stderr:          stderrBuffer.String(),
+		StdoutTruncated: stdoutBuffer.Truncated(),
+		StderrTruncated: stderrBuffer.Truncated(),
+		Duration:        duration,
+		DurationMS:      duration.Milliseconds(),
 	}
 
 	if timedOut {
-		return result, &CommandExecutionError{Message: "Command timed out", Result: result}
+		timeoutErr := error(&CommandExecutionError{Message: "Command timed out", Result: result})
+		if killErr != nil {
+			return result, errors.Join(timeoutErr, killErr)
+		}
+		return result, timeoutErr
 	}
 	if canceledErr != nil {
+		if killErr != nil {
+			return result, errors.Join(canceledErr, killErr)
+		}
 		return result, canceledErr
 	}
 	if result.ExitCode != 0 {
-		return result, &CommandExecutionError{Message: commandFailureMessage(result), Result: result}
+		cmdErr := error(&CommandExecutionError{Message: commandFailureMessage(result), Result: result})
+		// Containment contract: drain failures must surface even when the
+		// leader already failed validation/tool exit.
+		if drainErr != nil {
+			return result, errors.Join(cmdErr, drainErr)
+		}
+		return result, cmdErr
 	}
-	if waitErr != nil {
+	if waitErr != nil && !isExitError(waitErr) {
 		return result, waitErr
 	}
 	return result, nil
+}
+
+func reportContainmentFailure(tracker processcontainment.LiveTracker, errs ...error) {
+	if tracker == nil {
+		return
+	}
+	for _, err := range errs {
+		if err != nil {
+			tracker.ReportDrainFailure(err)
+		}
+	}
+}
+
+// awaitContainedCommand finishes a contained shell command without hanging on
+// cmd.Wait's pipe-copy phase. When a same-process-group descendant inherits
+// stdout/stderr and outlives the leader, Process.Wait reaps the leader (PID
+// goes ESRCH) while Wait is still blocked on copy EOF — poll that case and
+// Drain so containment can kill the descendant and unstick Wait.
+func awaitContainedCommand(
+	handle *processcontainment.Handle,
+	waitCtx, parentCtx context.Context,
+	hasTimeout bool,
+	gracefulShutdown time.Duration,
+	waitDone <-chan error,
+) (waitErr error, timedOut bool, canceledErr error, killErr error, drainErr error) {
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+
+	var alreadyDrained bool
+	for {
+		select {
+		case waitErr = <-waitDone:
+			if waitErr != nil && isContextError(waitErr) {
+				// Prefer the parent context error when it was the cause.
+				if parentCtx.Err() != nil {
+					canceledErr = parentCtx.Err()
+				} else if hasTimeout && errors.Is(waitErr, context.DeadlineExceeded) {
+					timedOut = true
+				} else {
+					canceledErr = waitErr
+				}
+				// Confirmed drain is the only stop success path (#574 / #577).
+				// Propagate Kill failures (e.g. ErrNotConfirmedDead) so callers learn
+				// that process-group containment failed rather than only seeing cancel/timeout.
+				killCtx, killCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
+				killErr = handle.Kill(killCtx)
+				killCancel()
+				return waitErr, timedOut, canceledErr, killErr, drainErr
+			}
+			if !alreadyDrained {
+				// Leader exited (zero or non-zero). Drain group members that outlived it.
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
+				if err := handle.Drain(drainCtx); err != nil {
+					// Surface drain failure after a finished leader so callers do not
+					// treat Run as successful while descendants remain runnable.
+					// Keep drainErr separate so non-zero exit paths can Join it and
+					// not drop ErrNotConfirmedDead behind CommandExecutionError.
+					drainErr = err
+					if waitErr == nil {
+						waitErr = drainErr
+					} else {
+						waitErr = errors.Join(waitErr, drainErr)
+					}
+				}
+				drainCancel()
+			}
+			return waitErr, timedOut, canceledErr, killErr, drainErr
+
+		case <-poll.C:
+			if alreadyDrained || !processPIDGone(handle.PID()) {
+				continue
+			}
+			// Leader reaped by cmd.Wait's Process.Wait, but pipe copy still
+			// blocks Wait. Drain kills pipe-holding descendants and unblocks it.
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), gracefulShutdown+drainSlack)
+			if err := handle.Drain(drainCtx); err != nil {
+				drainErr = err
+			}
+			drainCancel()
+			alreadyDrained = true
+			// Wait should complete once pipes close; bound the receive.
+			select {
+			case waitErr = <-waitDone:
+				if drainErr != nil {
+					if waitErr == nil {
+						waitErr = drainErr
+					} else if !isExitError(waitErr) {
+						waitErr = errors.Join(waitErr, drainErr)
+					}
+					// ExitError + drainErr: keep drainErr separate for Join below.
+				}
+				return waitErr, timedOut, canceledErr, killErr, drainErr
+			case <-time.After(gracefulShutdown + drainSlack):
+				if waitErr == nil {
+					if drainErr != nil {
+						waitErr = drainErr
+					} else {
+						waitErr = fmt.Errorf("shell wait did not complete after drain")
+					}
+				}
+				return waitErr, timedOut, canceledErr, killErr, drainErr
+			}
+		}
+	}
+}
+
+// processPIDGone reports whether pid is no longer addressable (reaped).
+// Used to detect the stuck-pipe Wait case: cmd.Wait reaped the leader via
+// Process.Wait but is still blocked on stdout/stderr copy goroutines.
+func processPIDGone(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return errors.Is(err, syscall.ESRCH)
+}
+
+func startContainedCommand(ctx context.Context, options Options, gracefulShutdown time.Duration, stdout, stderr *boundedBuffer) (*processcontainment.Handle, error) {
+	var lastErr error
+	for attempt := 0; attempt < startAttempts; attempt++ {
+		// Honor cancel before Start so producers that closed admission and
+		// canceled the work context cannot launch a new process (e.g. git
+		// worktree remove) after close — Wait-only cancel cannot undo Start.
+		// When StartGate is set, the gate rechecks under its critical section
+		// immediately around Start (admission hold); this is the fast path.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if attempt > 0 {
+			// Retry wait is outside StartGate so admission close can proceed
+			// between ETXTBSY attempts without waiting on the backoff timer.
+			wait := startRetryBaseWait * time.Duration(attempt)
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		cmd := exec.Command(options.Command, options.Args...)
+		cmd.Dir = options.CWD
+		if options.Env != nil {
+			cmd.Env = envSlice(options.Env)
+		}
+		if options.Stdin != "" {
+			cmd.Stdin = strings.NewReader(options.Stdin)
+		}
+		// Fresh buffers each attempt: Start never ran on failure, but reset
+		// so a partial Write cannot leak across retries if that ever changes.
+		stdout.reset()
+		stderr.reset()
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+		processcontainment.Configure(cmd)
+
+		start := func() error { return cmd.Start() }
+		var err error
+		if options.StartGate != nil {
+			err = options.StartGate(start)
+		} else {
+			err = start()
+		}
+		if err != nil {
+			lastErr = err
+			if isTextFileBusy(err) {
+				continue
+			}
+			return nil, err
+		}
+		handle, err := processcontainment.Bind(cmd, processcontainment.Options{
+			GracePeriod:  gracefulShutdown,
+			DrainTimeout: gracefulShutdown + drainSlack,
+		})
+		if err != nil {
+			killStartedWithoutHandle(cmd)
+			return nil, err
+		}
+		return handle, nil
+	}
+	return nil, lastErr
+}
+
+// killStartedWithoutHandle is only used when Bind fails after Start so the
+// orphaned process group is not left live. Production stop paths use Handle.Kill.
+func killStartedWithoutHandle(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	pid := cmd.Process.Pid
+	if pid > 0 {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+}
+
+func isTextFileBusy(err error) bool {
+	return errors.Is(err, syscall.ETXTBSY)
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func isExitError(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr)
 }
 
 func commandFailureMessage(result Result) string {
@@ -187,21 +488,22 @@ func envSlice(env map[string]string) []string {
 	return values
 }
 
-func exitCode(cmd *exec.Cmd) int {
-	if cmd == nil || cmd.ProcessState == nil {
+func exitCode(handle *processcontainment.Handle) int {
+	if handle == nil {
 		return -1
 	}
-	return cmd.ProcessState.ExitCode()
-}
-
-func isProcessDone(err error) bool {
-	return err == nil || err == os.ErrProcessDone
+	state := handle.ProcessState()
+	if state == nil {
+		return -1
+	}
+	return state.ExitCode()
 }
 
 type boundedBuffer struct {
-	mu    sync.Mutex
-	data  []byte
-	limit int
+	mu        sync.Mutex
+	data      []byte
+	limit     int
+	truncated bool
 }
 
 func newBoundedBuffer(limit int) *boundedBuffer {
@@ -216,18 +518,35 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 	defer b.mu.Unlock()
 	originalLen := len(p)
 	if len(b.data) >= b.limit {
+		if originalLen > 0 {
+			b.truncated = true
+		}
 		return originalLen, nil
 	}
 	remaining := b.limit - len(b.data)
 	if len(p) > remaining {
+		b.truncated = true
 		p = p[:remaining]
 	}
 	b.data = append(b.data, p...)
 	return originalLen, nil
 }
 
+func (b *boundedBuffer) reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.data = b.data[:0]
+	b.truncated = false
+}
+
 func (b *boundedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return string(b.data)
+}
+
+func (b *boundedBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.truncated
 }

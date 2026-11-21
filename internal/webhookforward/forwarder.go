@@ -26,9 +26,14 @@ const (
 	maxRetries               = 2
 )
 
+// ErrQueueFull means the sender can retry once pending discovery drains.
+var ErrQueueFull = errors.New("webhook forward queue is full")
+
 type Lane string
 
 const (
+	LanePlanner  Lane = "planner"
+	LaneWorker   Lane = "worker"
 	LaneReviewer Lane = "reviewer"
 	LaneFixer    Lane = "fixer"
 )
@@ -37,6 +42,21 @@ type DeliveryRequest struct {
 	DeliveryID string
 	EventType  string
 	Payload    []byte
+	// Repository is supplied by authenticated tunnel ingress, never by a
+	// delivery's JSON. Nil retains the legacy GitHub forwarding boundary.
+	Repository *config.RepositoryIdentity
+}
+
+// ProjectDiscovery carries one coalesced native delivery into the scheduler's
+// captured configuration, so a queued event cannot switch hosting instances.
+type ProjectDiscovery struct {
+	ProjectID     string
+	Repo          string
+	RepositoryKey string
+	ObjectType    string
+	Number        int64
+	Branch        string
+	Lanes         []Lane
 }
 
 type ForwardResult struct {
@@ -44,6 +64,11 @@ type ForwardResult struct {
 	Reason    string `json:"reason,omitempty"`
 	WorkItems int    `json:"workItems"`
 }
+
+// ErrAdmissionRefused is returned when AllowExecute refuses at Forward accept
+// time. HTTP and tunnel callers must map this to 503 SERVICE_UNAVAILABLE, not
+// 400 validation failure — temporary admission closed is not an invalid delivery.
+var ErrAdmissionRefused = errors.New("webhook forward admission refused")
 
 type Outcome struct {
 	At         string   `json:"at"`
@@ -82,6 +107,13 @@ type Stats struct {
 type Forwarder interface {
 	Forward(context.Context, DeliveryRequest) (ForwardResult, error)
 	Stats() Stats
+	// CancelExecute aborts in-flight discovery without waiting for workers to
+	// exit. BeginShutdown / Runtime.Stop should call this so process exit can
+	// abort discovery promptly. MarkDegraded must NOT call this: Forward may
+	// already have returned accepted/202 for in-memory queue entries, and
+	// sticky degrade leaves the daemon up with no GitHub retry for that
+	// delivery.
+	CancelExecute()
 	Close()
 }
 
@@ -94,11 +126,17 @@ type TargetedFixer interface {
 	DiscoverPullRequestsForBaseBranchUpdate(context.Context, fixer.BaseBranchDiscoveryInput) (fixer.DiscoveryResult, error)
 }
 
+type ConfigSource interface {
+	Snapshot() config.Config
+}
+
 type Options struct {
 	Repos              *storage.Repositories
 	Config             config.Config
+	ConfigSource       ConfigSource
 	Reviewer           TargetedReviewer
 	Fixer              TargetedFixer
+	DiscoverProject    func(context.Context, ProjectDiscovery) error
 	Logger             bootstrap.Logger
 	Now                func() time.Time
 	QueueCapacity      int
@@ -106,6 +144,21 @@ type Options struct {
 	DeliveryTTL        time.Duration
 	RetryDelay         time.Duration
 	RecentOutcomeLimit int
+	// AllowExecute, when set, is checked at Forward accept time only (#580).
+	// Accept-time refuse prevents in-memory discovery enqueue while admission is
+	// closed (HTTP/tunnel map ErrAdmissionRefused to 503 so GitHub can retry).
+	// Worker discovery does not recheck AllowExecute: once Forward returns
+	// accepted/202 the delivery is committed and must reach CreateOrGetActiveByDedupe
+	// even if admission later degrades. BeginShutdown aborts via CancelExecute
+	// (execCtx). Nil means ungated (tests).
+	AllowExecute func() error
+	// AllowExecuteWhile, when set, runs the accept-time enqueue + delivery
+	// bookkeeping critical section only while admission remains held (wire to
+	// Admission.WithAllowWork). Holding the same mutex as MarkDegraded/
+	// BeginShutdown makes check+enqueue+record atomic so Forward cannot return
+	// 202 while admission is already closed. When nil, Accept falls back to a
+	// point-in-time AllowExecute recheck then enqueue (tests).
+	AllowExecuteWhile func(fn func()) error
 }
 
 type deliveryRecord struct {
@@ -113,11 +166,12 @@ type deliveryRecord struct {
 }
 
 type workKey struct {
-	ProjectID  string
-	Repo       string
-	ObjectType string
-	Number     int64
-	Branch     string
+	ProjectID     string
+	Repo          string
+	ObjectType    string
+	Number        int64
+	Branch        string
+	RepositoryKey string
 }
 
 type workMetadata struct {
@@ -135,6 +189,7 @@ type workItem struct {
 }
 
 type routedDelivery struct {
+	repository *config.RepositoryIdentity
 	repo       string
 	objectType string
 	branch     string
@@ -195,8 +250,10 @@ type checkRunEnvelope struct {
 type forwarder struct {
 	repos              *storage.Repositories
 	cfg                config.Config
+	configSource       ConfigSource
 	reviewer           TargetedReviewer
 	fixer              TargetedFixer
+	discoverProject    func(context.Context, ProjectDiscovery) error
 	logger             bootstrap.Logger
 	now                func() time.Time
 	queueCapacity      int
@@ -204,6 +261,13 @@ type forwarder struct {
 	deliveryTTL        time.Duration
 	retryDelay         time.Duration
 	recentOutcomeLimit int
+	allowExecute       func() error
+	allowExecuteWhile  func(fn func()) error
+	// execCtx is canceled by CancelExecute / Close so process-exit shutdown can
+	// abort in-flight discovery. Sticky MarkDegraded must not cancel this —
+	// accepted deliveries still need to complete under a live daemon.
+	execCtx    context.Context
+	execCancel context.CancelFunc
 
 	mu              sync.Mutex
 	cond            *sync.Cond
@@ -242,11 +306,14 @@ func New(options Options) Forwarder {
 	if recentOutcomeLimit <= 0 {
 		recentOutcomeLimit = defaultRecentOutcomeSize
 	}
+	execCtx, execCancel := context.WithCancel(context.Background())
 	f := &forwarder{
 		repos:              options.Repos,
 		cfg:                options.Config,
+		configSource:       options.ConfigSource,
 		reviewer:           options.Reviewer,
 		fixer:              options.Fixer,
+		discoverProject:    options.DiscoverProject,
 		logger:             options.Logger,
 		now:                now,
 		queueCapacity:      queueCapacity,
@@ -254,6 +321,10 @@ func New(options Options) Forwarder {
 		deliveryTTL:        deliveryTTL,
 		retryDelay:         retryDelay,
 		recentOutcomeLimit: recentOutcomeLimit,
+		allowExecute:       options.AllowExecute,
+		allowExecuteWhile:  options.AllowExecuteWhile,
+		execCtx:            execCtx,
+		execCancel:         execCancel,
 		works:              map[string]*workItem{},
 		deliveries:         map[string]deliveryRecord{},
 	}
@@ -269,18 +340,42 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	if f.repos == nil || f.repos.Projects == nil {
 		return ForwardResult{}, fmt.Errorf("webhook forwarder repositories are not configured")
 	}
+	// Refuse new discovery enqueue while admission is closed. HTTP and tunnel
+	// listeners also project AllowMutations, but Forward is the shared enqueue
+	// boundary for both paths (#580). Wrap as ErrAdmissionRefused so post-gate
+	// callers map temporary refusal to 503 rather than 400 validation.
+	if f.allowExecute != nil {
+		if err := f.allowExecute(); err != nil {
+			return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
+		}
+	}
 	now := f.now().UTC()
 	deliveryID := strings.TrimSpace(request.DeliveryID)
 	eventType := strings.TrimSpace(request.EventType)
 	if deliveryID == "" {
-		return ForwardResult{}, fmt.Errorf("x-github-delivery header is required")
+		return ForwardResult{}, fmt.Errorf("webhook delivery header is required")
 	}
 	if eventType == "" {
-		return ForwardResult{}, fmt.Errorf("x-github-event header is required")
+		return ForwardResult{}, fmt.Errorf("webhook event header is required")
 	}
-	routed, ok, err := routeDelivery(eventType, request.Payload)
+	route := routeDelivery
+	if request.Repository != nil && request.Repository.Kind == config.ProviderKindForgejo {
+		route = routeForgejoDelivery
+	}
+	routed, ok, err := route(eventType, request.Payload)
 	if err != nil {
 		return ForwardResult{}, err
+	}
+	if request.Repository != nil {
+		identity := *request.Repository
+		if ok && !strings.EqualFold(identity.Repo, routed.repo) {
+			return ForwardResult{}, errors.New("webhook repository mismatch")
+		}
+		routed.repository = &identity
+	}
+	deliveryKey := deliveryID
+	if routed.repository != nil {
+		deliveryKey = routed.repository.Key() + "\x00" + deliveryID
 	}
 
 	f.mu.Lock()
@@ -290,12 +385,12 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	}
 	f.stats.DeliveriesReceived++
 	f.pruneExpiredDeliveriesLocked(now)
-	if _, exists := f.deliveries[deliveryID]; exists {
+	if _, exists := f.deliveries[deliveryKey]; exists {
 		f.stats.DeliveriesDeduped++
 		return ForwardResult{Status: "duplicate", Reason: "delivery_deduped", WorkItems: 0}, nil
 	}
 	if !ok {
-		f.deliveries[deliveryID] = deliveryRecord{expiresAt: now.Add(f.deliveryTTL)}
+		f.deliveries[deliveryKey] = deliveryRecord{expiresAt: now.Add(f.deliveryTTL)}
 		f.stats.DeliveriesIgnored++
 		return ForwardResult{Status: "ignored", Reason: "unsupported_event", WorkItems: 0}, nil
 	}
@@ -303,17 +398,55 @@ func (f *forwarder) Forward(ctx context.Context, request DeliveryRequest) (Forwa
 	if projectErr != nil {
 		return ForwardResult{}, projectErr
 	}
-	workItems, enqueueErr := f.enqueueLocked(projects, routed, workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID})
+	// Accept-time enqueue + delivery bookkeeping must be atomic with admission.
+	// allowExecute only holds the Admission mutex while reading state, and
+	// MarkDegraded does not take f.mu — so a point-in-time recheck under f.mu
+	// still races before the delivery is recorded. Prefer AllowExecuteWhile
+	// (Admission.WithAllowWork) so check+enqueue+record share the admission
+	// mutex; MarkDegraded blocks until the accepted-delivery outcome is written.
+	// After this section returns accepted/202, worker discovery must still run
+	// even if admission later degrades (no GitHub retry for 202). Fall back to
+	// point-in-time AllowExecute for ungated tests.
+	meta := workMetadata{EventType: eventType, Action: routed.action, DeliveryID: deliveryID}
+	var result ForwardResult
+	var enqueueErr error
+	recordAcceptedLocked := func(workItems int) {
+		f.deliveries[deliveryKey] = deliveryRecord{expiresAt: now.Add(f.deliveryTTL)}
+		if workItems == 0 {
+			f.stats.DeliveriesIgnored++
+			result = ForwardResult{Status: "ignored", Reason: "no_matching_projects", WorkItems: 0}
+			return
+		}
+		f.stats.DeliveriesAccepted++
+		result = ForwardResult{Status: "accepted", WorkItems: workItems}
+	}
+	if f.allowExecuteWhile != nil {
+		if err := f.allowExecuteWhile(func() {
+			workItems, err := f.enqueueLocked(projects, routed, meta)
+			enqueueErr = err
+			if enqueueErr != nil {
+				return
+			}
+			recordAcceptedLocked(workItems)
+		}); err != nil {
+			return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
+		}
+	} else {
+		if f.allowExecute != nil {
+			if err := f.allowExecute(); err != nil {
+				return ForwardResult{}, fmt.Errorf("%w: %w", ErrAdmissionRefused, err)
+			}
+		}
+		workItems, err := f.enqueueLocked(projects, routed, meta)
+		enqueueErr = err
+		if enqueueErr == nil {
+			recordAcceptedLocked(workItems)
+		}
+	}
 	if enqueueErr != nil {
 		return ForwardResult{}, enqueueErr
 	}
-	f.deliveries[deliveryID] = deliveryRecord{expiresAt: now.Add(f.deliveryTTL)}
-	if workItems == 0 {
-		f.stats.DeliveriesIgnored++
-		return ForwardResult{Status: "ignored", Reason: "no_matching_projects", WorkItems: 0}, nil
-	}
-	f.stats.DeliveriesAccepted++
-	return ForwardResult{Status: "accepted", WorkItems: workItems}, nil
+	return result, nil
 }
 
 func (f *forwarder) Stats() Stats {
@@ -328,7 +461,20 @@ func (f *forwarder) Stats() Stats {
 	return stats
 }
 
+// CancelExecute aborts in-flight worker discovery without waiting for drain.
+// Runtime.BeginShutdown / Runtime.Stop call this for process-exit promptness.
+// Runtime.MarkDegraded must not call this: accepted/202 deliveries still need
+// discovery under a live daemon (GitHub will not retry). Safe to call multiple
+// times; Close also cancels.
+func (f *forwarder) CancelExecute() {
+	if f == nil || f.execCancel == nil {
+		return
+	}
+	f.execCancel()
+}
+
 func (f *forwarder) Close() {
+	f.CancelExecute()
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
@@ -348,21 +494,40 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 	candidates := make([]candidate, 0, len(projects))
 	newQueueEntries := 0
 	matched := 0
+	cfg := f.cfg
+	if f.configSource != nil {
+		cfg = f.configSource.Snapshot()
+	}
 	for _, project := range projects {
 		if project.Archived {
 			continue
 		}
 		repo := repoFromProjectMetadata(project.MetadataJSON)
+		configured, configuredOK := configuredProjectByID(cfg, project.ID)
+		repositoryKey := ""
+		if routed.repository != nil {
+			if !configuredOK {
+				continue
+			}
+			identity, resolved := config.ProjectRepositoryIdentity(cfg, configured)
+			if !resolved || identity.Key() != routed.repository.Key() || config.ProjectWebhookMode(cfg, configured) != config.WebhookModeTunnel {
+				continue
+			}
+			repo = identity.Repo
+			repositoryKey = identity.Key()
+		} else if configuredOK && config.ResolvedProjectProviderKind(cfg, configured) == config.ProviderKindForgejo {
+			continue
+		}
 		if !strings.EqualFold(repo, routed.repo) {
 			continue
 		}
-		lanes := enabledLanesForProject(f.cfg, project.ID, routed.lanes)
+		lanes := enabledLanesForProject(cfg, project.ID, routed.lanes)
 		if len(lanes) == 0 {
 			continue
 		}
-		if routed.objectType == "base_branch" {
+		if routed.objectType == "base_branch" || routed.objectType == "repository" {
 			matched++
-			key := workKey{ProjectID: project.ID, Repo: repo, ObjectType: routed.objectType, Branch: routed.branch}
+			key := workKey{ProjectID: project.ID, Repo: repo, ObjectType: routed.objectType, Branch: routed.branch, RepositoryKey: repositoryKey}
 			candidates = append(candidates, candidate{key: key, lanes: lanes})
 			itemKey := workKeyString(key)
 			item, exists := f.works[itemKey]
@@ -377,7 +542,7 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 				continue
 			}
 			matched++
-			key := workKey{ProjectID: project.ID, Repo: repo, ObjectType: routed.objectType, Number: number}
+			key := workKey{ProjectID: project.ID, Repo: repo, ObjectType: routed.objectType, Number: number, RepositoryKey: repositoryKey}
 			candidates = append(candidates, candidate{key: key, lanes: lanes})
 			itemKey := workKeyString(key)
 			item, exists := f.works[itemKey]
@@ -389,7 +554,7 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 	}
 	if newQueueEntries > f.queueCapacity-len(f.queue) {
 		f.stats.QueueRejected++
-		return 0, fmt.Errorf("webhook forward queue is full")
+		return 0, ErrQueueFull
 	}
 	for _, candidate := range candidates {
 		itemKey := workKeyString(candidate.key)
@@ -414,6 +579,15 @@ func (f *forwarder) enqueueLocked(projects []storage.ProjectRecord, routed route
 	return matched, nil
 }
 
+func configuredProjectByID(cfg config.Config, projectID string) (config.ProjectRefConfig, bool) {
+	for _, project := range cfg.Projects {
+		if project.ID == projectID {
+			return project, true
+		}
+	}
+	return config.ProjectRefConfig{}, false
+}
+
 func (f *forwarder) worker() {
 	defer f.workersDone.Done()
 	for {
@@ -421,7 +595,9 @@ func (f *forwarder) worker() {
 		if !ok {
 			return
 		}
-		outcome := f.executeWithRetry(context.Background(), key, item)
+		// Use the cancelable exec context so BeginShutdown/Stop can abort
+		// discovery on process exit. MarkDegraded must not cancel execCtx.
+		outcome := f.executeWithRetry(f.execCtx, key, item)
 		f.finishWork(key, outcome)
 	}
 }
@@ -525,6 +701,33 @@ func (f *forwarder) executeWithRetry(ctx context.Context, key workKey, item work
 }
 
 func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem) error {
+	// Admission was already checked at Forward accept time. Do not recheck
+	// AllowExecute here: dropping queued work after accepted/202 loses the
+	// delivery (in-memory dedupe only; GitHub will not retry). Process-exit
+	// shutdown aborts via canceled execCtx from CancelExecute.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if key.RepositoryKey != "" {
+		stored, err := f.repos.Projects.GetByID(ctx, key.ProjectID)
+		if err != nil {
+			return err
+		}
+		if stored == nil || stored.Archived {
+			return nil
+		}
+		if len(item.lanes) == 0 {
+			return nil
+		}
+		if f.discoverProject == nil {
+			return errors.New("project webhook discovery is not configured")
+		}
+		lanes := make([]Lane, 0, len(item.lanes))
+		for _, lane := range sortedLaneStrings(item.lanes) {
+			lanes = append(lanes, Lane(lane))
+		}
+		return f.discoverProject(ctx, ProjectDiscovery{ProjectID: key.ProjectID, Repo: key.Repo, RepositoryKey: key.RepositoryKey, ObjectType: key.ObjectType, Number: key.Number, Branch: key.Branch, Lanes: lanes})
+	}
 	if _, ok := item.lanes[LaneReviewer]; ok {
 		if f.reviewer == nil {
 			return fmt.Errorf("reviewer targeted discovery is not configured")
@@ -532,6 +735,9 @@ func (f *forwarder) executeOnce(ctx context.Context, key workKey, item workItem)
 		if _, err := f.reviewer.DiscoverPullRequest(ctx, reviewer.TargetedDiscoveryInput{ProjectID: key.ProjectID, Repo: key.Repo, PRNumber: key.Number}); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if _, ok := item.lanes[LaneFixer]; ok {
 		if f.fixer == nil {
@@ -617,7 +823,7 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 			return routedDelivery{}, false, errors.New("issue_comment webhook missing repository or number")
 		}
 		return routedDelivery{}, false, nil
-	case "pull_request_review", "pull_request_review_comment":
+	case "pull_request_review":
 		var envelope pullRequestEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {
 			return routedDelivery{}, false, fmt.Errorf("decode %s webhook: %w", eventType, err)
@@ -626,6 +832,27 @@ func routeDelivery(eventType string, payload []byte) (routedDelivery, bool, erro
 			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
 		}
 		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneFixer: {}}}, true, nil
+	case "pull_request_review_comment":
+		var envelope pullRequestEnvelope
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return routedDelivery{}, false, fmt.Errorf("decode %s webhook: %w", eventType, err)
+		}
+		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
+			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
+		}
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneReviewer: {}, LaneFixer: {}}}, true, nil
+	case "pull_request_review_thread":
+		var envelope pullRequestEnvelope
+		if err := json.Unmarshal(payload, &envelope); err != nil {
+			return routedDelivery{}, false, fmt.Errorf("decode %s webhook: %w", eventType, err)
+		}
+		if strings.TrimSpace(envelope.Action) != "resolved" {
+			return routedDelivery{}, false, nil
+		}
+		if strings.TrimSpace(envelope.Repository.FullName) == "" || envelope.PullRequest.Number <= 0 {
+			return routedDelivery{}, false, fmt.Errorf("%s webhook missing repository or number", eventType)
+		}
+		return routedDelivery{repo: strings.TrimSpace(envelope.Repository.FullName), objectType: "pull_request", numbers: []int64{envelope.PullRequest.Number}, action: strings.TrimSpace(envelope.Action), lanes: map[Lane]struct{}{LaneReviewer: {}, LaneFixer: {}}}, true, nil
 	case "push":
 		var envelope pushEnvelope
 		if err := json.Unmarshal(payload, &envelope); err != nil {
@@ -694,6 +921,12 @@ func isFailingCheckConclusion(conclusion string) bool {
 func enabledLanesForProject(cfg config.Config, projectID string, lanes map[Lane]struct{}) map[Lane]struct{} {
 	roles := config.ProjectRoleConfigs(cfg, projectID)
 	result := map[Lane]struct{}{}
+	if _, ok := lanes[LanePlanner]; ok && roles.Planner.AutoDiscovery {
+		result[LanePlanner] = struct{}{}
+	}
+	if _, ok := lanes[LaneWorker]; ok && roles.Worker.AutoDiscovery {
+		result[LaneWorker] = struct{}{}
+	}
 	if _, ok := lanes[LaneReviewer]; ok && roles.Reviewer.Discovery.AutoDiscovery {
 		result[LaneReviewer] = struct{}{}
 	}
@@ -716,7 +949,7 @@ func repoFromProjectMetadata(metadataJSON *string) string {
 }
 
 func workKeyString(key workKey) string {
-	return fmt.Sprintf("%s|%s|%s|%d|%s", key.ProjectID, strings.ToLower(key.Repo), key.ObjectType, key.Number, key.Branch)
+	return fmt.Sprintf("%s|%s|%s|%d|%s|%s", key.ProjectID, strings.ToLower(key.Repo), key.ObjectType, key.Number, key.Branch, key.RepositoryKey)
 }
 
 func copyLanes(lanes map[Lane]struct{}) map[Lane]struct{} {

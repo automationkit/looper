@@ -1,0 +1,825 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/nexu-io/looper/internal/config"
+	"github.com/nexu-io/looper/internal/domain"
+	"github.com/nexu-io/looper/internal/eventlog"
+	gitinfra "github.com/nexu-io/looper/internal/infra/git"
+	looperdruntime "github.com/nexu-io/looper/internal/runtime"
+	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
+	pkgapi "github.com/nexu-io/looper/pkg/api"
+)
+
+type worktreeDiscardResult struct {
+	WorktreePath *string `json:"worktreePath,omitempty"`
+	Discarded    bool    `json:"discarded"`
+	NoOp         bool    `json:"noOp"`
+	Reason       string  `json:"reason,omitempty"`
+}
+
+// worktreeClearUnusableResult is the operator opt-in clear of a hollow managed
+// worktree path (not a usable git checkout). Distinct from discard (git
+// reset/clean keeps the directory).
+//
+// Design trade-off (new clear flag + unusable_path reason):
+//
+// Failure prevented: operators parked on managed_worktree_integrity MI with
+// non-empty hollow leftovers had only shell rm + retry; Dashboard offered
+// "Retry without discard" which cannot clear the path, and Discard is the wrong
+// primitive (requires a valid checkout and never deletes the directory).
+//
+// Cost: new API field clearUnusableWorktreePath mutually exclusive with
+// discardWorktreeChanges; new preflight reason; CLI/dashboard must not overload
+// discard. Full RemoveAll of operator-confirmed managed paths can delete agent
+// leftovers — confirm dialog is the gate (same spirit as discard).
+//
+// Why not simpler: widen ClearUnusableManagedPath auto-delete → data-loss risk
+// already rejected by tests/oracle. Overload discardWorktreeChanges → wrong
+// semantics and fails on hollow paths. Separate endpoint then retry → worse
+// atomicity with requeue locks.
+//
+// Authority: LocalCheckoutUsable + managed-path Validate; not agent output.
+type worktreeClearUnusableResult struct {
+	WorktreePath *string `json:"worktreePath,omitempty"`
+	Cleared      bool    `json:"cleared"`
+	NoOp         bool    `json:"noOp"`
+	Reason       string  `json:"reason,omitempty"`
+}
+
+// loopWorktreeStatusResponse is the read-only preflight for retry/jump UX.
+//
+// Design trade-off (new status concept + preflight gate on retry):
+//
+// Failure prevented: operators and the dashboard used to call POST /retry while a
+// managed agent worktree was dirty. Retry re-prepares from HEAD and either fails
+// prepare-worktree or silently collides with uncommitted local edits. Without a
+// structured preflight, clients could only guess from logs after the damage.
+//
+// Cost / edge cases:
+//   - New wire fields (present/managed/clean/dirty/reason) that CLI and dashboard
+//     must interpret consistently; drift between clients is a real risk.
+//   - Extra GET before every interactive retry (latency + one more auth/path).
+//   - status_unavailable and unmanaged reasons force fail-closed discard offers
+//     while still exposing path for inspect — more branches than a pure 409.
+//   - Old daemons without /worktree must keep plain-retry fallback so upgrades
+//     are not a hard break.
+//
+// Why not simpler alternatives:
+//   - Delete the gate / trust the agent: dirty trees are operator-local state the
+//     agent did not declare; trusting retry to "just work" already caused lost
+//     edits and opaque prepare failures. Agent structured output cannot see the
+//     worktree after the run ended.
+//   - Fail loud only (hard 409 on dirty retry): blocks the legitimate "discard
+//     and retry" path and gives no jump/inspect guidance when the operator wants
+//     to keep local changes. Preflight keeps authority on the daemon's on-disk
+//     git status while letting the operator choose discard vs inspect.
+//
+// Authority: the daemon's worktree resolution + git status are the authority for
+// present/managed/dirty; the agent does not emit this after the run completes.
+// Clients may gate UX on the response but must not invent discard safety.
+//
+// Semantics:
+//   - present: path exists on disk (after successful stat)
+//   - worktreePath/branch: resolved location hints even when missing on disk
+//   - managed: path is under a Looper-managed worktree root (discard-safe)
+//   - clean/dirty: set only when git status succeeds; omitted on status_unavailable
+//     and unusable_path
+//   - reason: no_worktree | worktree_missing | status_unavailable | unusable_path |
+//     already_clean | dirty | loop_type_without_worktree | unmanaged
+//
+// unusable_path (new): present managed path fails LocalCheckoutUsable — hollow
+// leftovers that discard cannot repair. Distinct from status_unavailable (git
+// repo present but status failed). Authority: filesystem checkout probe + managed
+// Validate, not agent output.
+type loopWorktreeStatusResponse struct {
+	LoopID       string  `json:"loopId"`
+	Seq          int64   `json:"seq"`
+	Present      bool    `json:"present"`
+	WorktreePath *string `json:"worktreePath,omitempty"`
+	Branch       *string `json:"branch,omitempty"`
+	Managed      bool    `json:"managed"`
+	Clean        *bool   `json:"clean,omitempty"`
+	Dirty        *bool   `json:"dirty,omitempty"`
+	Reason       string  `json:"reason,omitempty"`
+	// SupportsClearUnusablePath is always true on daemons that implement
+	// clearUnusableWorktreePath. Clients must require this before POST /retry
+	// with clear so pre-change daemons (which omit the field) never queue a
+	// plain retry after a failed clear acknowledgement.
+	SupportsClearUnusablePath bool `json:"supportsClearUnusablePath"`
+}
+
+type checkpointWorktreeRef struct {
+	ID       string `json:"id,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Branch   string `json:"branch,omitempty"`
+	PRNumber int64  `json:"prNumber,omitempty"`
+}
+
+// checkpointWithWorktree extracts worktree location hints from a run checkpoint.
+// When prepare-worktree fails on a dirty tree it often returns before writing
+// checkpoint.worktree, leaving only work.branch (worker) or detail.headRefName
+// (fixer). Those branch hints still resolve the managed worktree row.
+// For push-existing workers, work.branch may be empty while the worktree was
+// created under pr-<PRNumber>; executionMode + prNumber recover that branch.
+// PRNumber (from work.prNumber or detail.prNumber) disambiguates branch-only
+// lookups when multiple PRs share a head branch name.
+type checkpointWithWorktree struct {
+	Worktree *checkpointWorktreeRef `json:"worktree,omitempty"`
+	Work     *struct {
+		Branch        string `json:"branch,omitempty"`
+		ExecutionMode string `json:"executionMode,omitempty"`
+		PRNumber      int64  `json:"prNumber,omitempty"`
+	} `json:"work,omitempty"`
+	Detail *struct {
+		HeadRefName string `json:"headRefName,omitempty"`
+		PRNumber    int64  `json:"prNumber,omitempty"`
+	} `json:"detail,omitempty"`
+}
+
+// loopWorktreeStatus resolves the managed worktree for a loop and reports
+// whether git status is clean. Used by CLI/dashboard retry preflight and jump.
+func (h *Handler) loopWorktreeStatus(ctx context.Context, loop storage.LoopRecord) (loopWorktreeStatusResponse, error) {
+	resp := loopWorktreeStatusResponse{
+		LoopID:                    loop.ID,
+		Seq:                       loop.Seq,
+		SupportsClearUnusablePath: true,
+	}
+	if loop.Type != string(domain.LoopTypePlanner) && loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeWorker) {
+		resp.Reason = "loop_type_without_worktree"
+		return resp, nil
+	}
+	services := h.context.Runtime.Services()
+	if services.Repositories == nil {
+		return loopWorktreeStatusResponse{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, loop.ProjectID)
+	if err != nil {
+		return loopWorktreeStatusResponse{}, err
+	}
+	resolved, err := resolveManagedWorktreeForLoop(ctx, services.Repositories, *project, loop)
+	if err != nil {
+		return loopWorktreeStatusResponse{}, err
+	}
+	if resolved == nil || strings.TrimSpace(resolved.Path) == "" {
+		resp.Reason = "no_worktree"
+		return resp, nil
+	}
+	path := strings.TrimSpace(resolved.Path)
+	resp.WorktreePath = stringPtrOrNil(path)
+	resp.Branch = stringPtrOrNil(strings.TrimSpace(resolved.Branch))
+	resp.Managed = resolved.Managed
+	if _, statErr := os.Stat(path); statErr != nil {
+		if os.IsNotExist(statErr) {
+			// Path resolved but not on disk — present stays false so jump refuses cd.
+			resp.Reason = "worktree_missing"
+			return resp, nil
+		}
+		return loopWorktreeStatusResponse{}, apiError{
+			code:    pkgapi.ErrorCodeInternalError,
+			status:  http.StatusInternalServerError,
+			message: fmt.Sprintf("Failed to stat worktree at %s: %v", path, statErr),
+		}
+	}
+	resp.Present = true
+	if !resolved.Managed {
+		// Still report path for inspect; discard is not offered by clients.
+		resp.Reason = "unmanaged"
+	}
+	// Hollow / non-checkout leftovers: classify before git status so clients can
+	// offer clear-unusable instead of lumping into status_unavailable.
+	if resolved.Managed && !worktreesafety.LocalCheckoutUsable(path) {
+		resp.Reason = "unusable_path"
+		return resp, nil
+	}
+	gitPath := ""
+	if h.context.Config.Tools.GitPath != nil {
+		gitPath = strings.TrimSpace(*h.context.Config.Tools.GitPath)
+	}
+	gateway := gitinfra.New(gitinfra.Options{GitPath: gitPath, Repos: services.Repositories, Now: h.now})
+	clean, cleanErr := gateway.WorktreeClean(ctx, path)
+	if cleanErr != nil {
+		// Keep path for jump/inspect; omit clean/dirty so clients fail closed on discard.
+		if resp.Reason == "" {
+			resp.Reason = "status_unavailable"
+		}
+		return resp, nil
+	}
+	resp.Clean = &clean
+	dirty := !clean
+	resp.Dirty = &dirty
+	if !resolved.Managed {
+		// Prefer unmanaged over clean/dirty so clients do not offer discard.
+		resp.Reason = "unmanaged"
+		return resp, nil
+	}
+	if clean {
+		resp.Reason = "already_clean"
+	} else {
+		resp.Reason = "dirty"
+	}
+	return resp, nil
+}
+
+// clearLoopUnusableWorktreePath performs the operator opt-in RemoveAll of a
+// managed path that is not a usable local checkout. Active run/queue must
+// already be refused by the caller (same preflight as discard).
+// expectedWorktreePath is the path the operator confirmed (from GET /worktree);
+// clear refuses when the daemon-resolved path differs so a stale confirm cannot
+// delete a different managed leftover.
+func (h *Handler) clearLoopUnusableWorktreePath(ctx context.Context, services looperdruntime.Services, loop storage.LoopRecord, expectedWorktreePath string) (worktreeClearUnusableResult, error) {
+	if loop.Type != string(domain.LoopTypePlanner) && loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeWorker) {
+		return worktreeClearUnusableResult{NoOp: true, Reason: "loop_type_without_worktree"}, nil
+	}
+	if services.Repositories == nil {
+		return worktreeClearUnusableResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+
+	expectedWorktreePath = strings.TrimSpace(expectedWorktreePath)
+	if expectedWorktreePath == "" {
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: expectedWorktreePath is required", loop.ID),
+		}
+	}
+
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, loop.ProjectID)
+	if err != nil {
+		return worktreeClearUnusableResult{}, err
+	}
+
+	resolved, err := resolveManagedWorktreeForLoop(ctx, services.Repositories, *project, loop)
+	if err != nil {
+		return worktreeClearUnusableResult{}, err
+	}
+	if resolved == nil || strings.TrimSpace(resolved.Path) == "" {
+		return worktreeClearUnusableResult{NoOp: true, Reason: "no_worktree"}, nil
+	}
+
+	path := strings.TrimSpace(resolved.Path)
+	if !sameFilesystemPath(path, expectedWorktreePath) {
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusConflict,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: resolved path %s does not match confirmed path %s (re-fetch GET /worktree and confirm again)", loop.ID, path, expectedWorktreePath),
+		}
+	}
+	if sameFilesystemPath(path, project.RepoPath) {
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: path must not equal project repo path", loop.ID),
+		}
+	}
+	if !resolved.Managed {
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: path %s is not a Looper-managed worktree", loop.ID, path),
+		}
+	}
+
+	if _, statErr := os.Stat(path); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return worktreeClearUnusableResult{
+				WorktreePath: stringPtrOrNil(path),
+				Cleared:      false,
+				NoOp:         true,
+				Reason:       "worktree_missing",
+			}, nil
+		}
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeInternalError,
+			status:  http.StatusInternalServerError,
+			message: fmt.Sprintf("Failed to stat worktree at %s: %v", path, statErr),
+		}
+	}
+
+	if err := worktreesafety.ClearManagedUnusablePathForOperator(worktreesafety.CheckInput{
+		WorktreePath: path,
+		RepoPath:     project.RepoPath,
+		WorktreeRoot: resolved.WorktreeRoot,
+	}, path); err != nil {
+		if errors.Is(err, worktreesafety.ErrUsableCheckoutRefusesClear) {
+			return worktreeClearUnusableResult{}, apiError{
+				code:    pkgapi.ErrorCodeValidationFailed,
+				status:  http.StatusBadRequest,
+				message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: path is a usable checkout (use discardWorktreeChanges or plain retry)", loop.ID),
+			}
+		}
+		return worktreeClearUnusableResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot clear unusable worktree path for loop %s: %v", loop.ID, err),
+		}
+	}
+
+	result := worktreeClearUnusableResult{
+		WorktreePath: stringPtrOrNil(path),
+		Cleared:      true,
+		NoOp:         false,
+		Reason:       "cleared",
+	}
+
+	projectID := loop.ProjectID
+	loopID := loop.ID
+	payload := map[string]any{
+		"worktreePath": path,
+		"branch":       resolved.Branch,
+		"noOp":         result.NoOp,
+		"reason":       result.Reason,
+		"cleared":      result.Cleared,
+		"source":       resolved.Source,
+	}
+	if resolved.ID != "" {
+		payload["worktreeId"] = resolved.ID
+	}
+	_ = eventlog.Append(ctx, services.Repositories, eventlog.AppendInput{
+		EventType: "looper.worktree.unusable_path_cleared",
+		ProjectID: &projectID,
+		LoopID:    &loopID,
+		ActorType: stringPtrOrNil("operator"),
+		ActorID:   stringPtrOrNil("cli"),
+		Payload:   payload,
+		CreatedAt: h.now().UTC(),
+	})
+	return result, nil
+}
+
+// discardLoopWorktreeChanges performs the operator opt-in dirty-worktree discard
+// for loop retry. Agent loops (planner/fixer/reviewer/worker) resolve a managed
+// worktree from the latest run checkpoint or worktree row; loops without a
+// resolvable managed worktree are no-ops. Active run/queue must already be
+// refused by the caller.
+func (h *Handler) discardLoopWorktreeChanges(ctx context.Context, services looperdruntime.Services, loop storage.LoopRecord) (worktreeDiscardResult, error) {
+	if loop.Type != string(domain.LoopTypePlanner) && loop.Type != string(domain.LoopTypeFixer) && loop.Type != string(domain.LoopTypeReviewer) && loop.Type != string(domain.LoopTypeWorker) {
+		return worktreeDiscardResult{NoOp: true, Reason: "loop_type_without_worktree"}, nil
+	}
+	if services.Repositories == nil {
+		return worktreeDiscardResult{}, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: "Storage is not configured"}
+	}
+
+	project, err := requireActiveProjectRecord(ctx, services.Repositories.Projects, loop.ProjectID)
+	if err != nil {
+		return worktreeDiscardResult{}, err
+	}
+
+	resolved, err := resolveManagedWorktreeForLoop(ctx, services.Repositories, *project, loop)
+	if err != nil {
+		return worktreeDiscardResult{}, err
+	}
+	if resolved == nil || strings.TrimSpace(resolved.Path) == "" {
+		return worktreeDiscardResult{NoOp: true, Reason: "no_worktree"}, nil
+	}
+
+	if err := worktreesafety.Validate(worktreesafety.CheckInput{
+		WorktreePath: resolved.Path,
+		RepoPath:     project.RepoPath,
+		WorktreeRoot: resolved.WorktreeRoot,
+	}); err != nil {
+		return worktreeDiscardResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot discard worktree changes for loop %s: %v", loop.ID, err),
+		}
+	}
+	if sameFilesystemPath(resolved.Path, project.RepoPath) {
+		return worktreeDiscardResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot discard worktree changes for loop %s: path must not equal project repo path", loop.ID),
+		}
+	}
+	if !resolved.Managed {
+		return worktreeDiscardResult{}, apiError{
+			code:    pkgapi.ErrorCodeValidationFailed,
+			status:  http.StatusBadRequest,
+			message: fmt.Sprintf("Cannot discard worktree changes for loop %s: path %s is not a Looper-managed worktree", loop.ID, resolved.Path),
+		}
+	}
+
+	gitPath := ""
+	if h.context.Config.Tools.GitPath != nil {
+		gitPath = strings.TrimSpace(*h.context.Config.Tools.GitPath)
+	}
+	gateway := gitinfra.New(gitinfra.Options{GitPath: gitPath, Repos: services.Repositories, Now: h.now})
+	discard, err := gateway.DiscardWorktreeChanges(ctx, gitinfra.DiscardWorktreeChangesInput{
+		RepoPath:     project.RepoPath,
+		WorktreeRoot: resolved.WorktreeRoot,
+		WorktreePath: resolved.Path,
+	})
+	if err != nil {
+		return worktreeDiscardResult{}, apiError{
+			code:    pkgapi.ErrorCodeInternalError,
+			status:  http.StatusInternalServerError,
+			message: fmt.Sprintf("Failed to discard worktree changes at %s: %v", resolved.Path, err),
+		}
+	}
+
+	path := discard.WorktreePath
+	if path == "" {
+		path = resolved.Path
+	}
+	result := worktreeDiscardResult{
+		WorktreePath: stringPtrOrNil(path),
+		Discarded:    !discard.NoOp,
+		NoOp:         discard.NoOp,
+	}
+	if discard.NoOp {
+		if _, statErr := os.Stat(path); statErr != nil && os.IsNotExist(statErr) {
+			result.Reason = "worktree_missing"
+		} else {
+			result.Reason = "already_clean"
+		}
+	} else {
+		result.Reason = "discarded"
+	}
+
+	projectID := loop.ProjectID
+	loopID := loop.ID
+	payload := map[string]any{
+		"worktreePath": path,
+		"branch":       resolved.Branch,
+		"noOp":         result.NoOp,
+		"reason":       result.Reason,
+		"discarded":    result.Discarded,
+		"source":       resolved.Source,
+	}
+	if resolved.ID != "" {
+		payload["worktreeId"] = resolved.ID
+	}
+	// Audit is best-effort: git discard already succeeded, and retry must still
+	// requeue. A transient events write failure must not strand the operator.
+	_ = eventlog.Append(ctx, services.Repositories, eventlog.AppendInput{
+		EventType: "looper.worktree.changes_discarded",
+		ProjectID: &projectID,
+		LoopID:    &loopID,
+		ActorType: stringPtrOrNil("operator"),
+		ActorID:   stringPtrOrNil("cli"),
+		Payload:   payload,
+		CreatedAt: h.now().UTC(),
+	})
+	return result, nil
+}
+
+type managedWorktreeRef struct {
+	Path         string
+	Branch       string
+	ID           string
+	WorktreeRoot string
+	Source       string
+	Managed      bool
+}
+
+func resolveManagedWorktreeForLoop(ctx context.Context, repos *storage.Repositories, project storage.ProjectRecord, loop storage.LoopRecord) (*managedWorktreeRef, error) {
+	worktreeRoot, err := projectWorktreeRoot(project)
+	if err != nil {
+		return nil, apiError{code: pkgapi.ErrorCodeInternalError, status: http.StatusInternalServerError, message: err.Error()}
+	}
+
+	var fromCheckpoint *checkpointWorktreeRef
+	latestRun, err := repos.Runs.GetLatestByLoopID(ctx, loop.ID)
+	if err != nil {
+		return nil, err
+	}
+	if latestRun != nil && latestRun.CheckpointJSON != nil {
+		fromCheckpoint = parseCheckpointWorktree(latestRun.CheckpointJSON)
+	}
+
+	// Prefer loop.PRNumber, then checkpoint PR hints. GitHub head branch names are
+	// not unique across forks/PRs; CreateWorktree embeds pr-<N> in the directory.
+	prNumber := int64(0)
+	if loop.PRNumber != nil && *loop.PRNumber > 0 {
+		prNumber = *loop.PRNumber
+	}
+	if prNumber == 0 && fromCheckpoint != nil && fromCheckpoint.PRNumber > 0 {
+		prNumber = fromCheckpoint.PRNumber
+	}
+
+	var record *storage.WorktreeRecord
+	if fromCheckpoint != nil {
+		if id := strings.TrimSpace(fromCheckpoint.ID); id != "" {
+			record, err = repos.Worktrees.GetByID(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if record == nil {
+			path := strings.TrimSpace(fromCheckpoint.Path)
+			if path != "" {
+				record, err = findProjectWorktreeByPath(ctx, repos, project.ID, path)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		if record == nil {
+			if branch := strings.TrimSpace(fromCheckpoint.Branch); branch != "" {
+				record, err = findProjectWorktreeByBranch(ctx, repos, project.ID, branch, prNumber)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+	// When checkpoint only has a branch (or none) but the loop is PR-scoped,
+	// resolve via PR-tagged managed path so we never pick a sibling PR's row.
+	if record == nil && prNumber > 0 {
+		record, err = findProjectWorktreeByPR(ctx, repos, project.ID, prNumber)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	path := ""
+	branch := ""
+	id := ""
+	source := ""
+	if record != nil && strings.TrimSpace(record.WorktreePath) != "" && record.CleanedAt == nil {
+		path = strings.TrimSpace(record.WorktreePath)
+		branch = strings.TrimSpace(record.Branch)
+		id = record.ID
+		source = "worktree_record"
+	}
+	if path == "" && fromCheckpoint != nil && strings.TrimSpace(fromCheckpoint.Path) != "" {
+		path = strings.TrimSpace(fromCheckpoint.Path)
+		branch = strings.TrimSpace(fromCheckpoint.Branch)
+		id = strings.TrimSpace(fromCheckpoint.ID)
+		source = "checkpoint"
+	}
+	if path == "" {
+		return nil, nil
+	}
+
+	managed := false
+	if worktreeRoot != "" && worktreesafety.IsSafe(worktreesafety.CheckInput{
+		WorktreePath: path,
+		RepoPath:     project.RepoPath,
+		WorktreeRoot: worktreeRoot,
+	}) {
+		managed = true
+	}
+	if record != nil && sameFilesystemPath(record.WorktreePath, path) && record.ProjectID == project.ID {
+		// Recorded worktree rows for this project are managed, even when the
+		// path only barely satisfies root checks via the stored record.
+		if worktreesafety.IsSafe(worktreesafety.CheckInput{
+			WorktreePath: path,
+			RepoPath:     project.RepoPath,
+			WorktreeRoot: worktreeRoot,
+		}) {
+			managed = true
+		}
+	}
+
+	return &managedWorktreeRef{
+		Path:         path,
+		Branch:       branch,
+		ID:           id,
+		WorktreeRoot: worktreeRoot,
+		Source:       source,
+		Managed:      managed,
+	}, nil
+}
+
+func parseCheckpointWorktree(raw *string) *checkpointWorktreeRef {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil
+	}
+	var checkpoint checkpointWithWorktree
+	if err := json.Unmarshal([]byte(*raw), &checkpoint); err != nil {
+		return nil
+	}
+	path := ""
+	branch := ""
+	id := ""
+	prNumber := int64(0)
+	if checkpoint.Worktree != nil {
+		path = strings.TrimSpace(checkpoint.Worktree.Path)
+		branch = strings.TrimSpace(checkpoint.Worktree.Branch)
+		id = strings.TrimSpace(checkpoint.Worktree.ID)
+	}
+	// Dirty prepare-worktree often aborts before checkpoint.worktree is set.
+	// Prefer an explicit worktree.branch, then worker work.branch, then
+	// push-existing pr-<N> (CreateWorktree branch when work.branch is empty),
+	// then fixer detail.headRefName so branch/PR lookup can still locate the row.
+	if checkpoint.Work != nil && checkpoint.Work.PRNumber > 0 {
+		prNumber = checkpoint.Work.PRNumber
+	}
+	if prNumber == 0 && checkpoint.Detail != nil && checkpoint.Detail.PRNumber > 0 {
+		prNumber = checkpoint.Detail.PRNumber
+	}
+	if branch == "" && checkpoint.Work != nil {
+		branch = strings.TrimSpace(checkpoint.Work.Branch)
+		if branch == "" &&
+			strings.TrimSpace(checkpoint.Work.ExecutionMode) == "push-existing" &&
+			checkpoint.Work.PRNumber > 0 {
+			// Matches worker runPrepareWorktreeStep when work.Branch is empty.
+			branch = fmt.Sprintf("pr-%d", checkpoint.Work.PRNumber)
+		}
+	}
+	if branch == "" && checkpoint.Detail != nil {
+		branch = strings.TrimSpace(checkpoint.Detail.HeadRefName)
+	}
+	if path == "" && branch == "" && id == "" && prNumber == 0 {
+		return nil
+	}
+	return &checkpointWorktreeRef{ID: id, Path: path, Branch: branch, PRNumber: prNumber}
+}
+
+func findProjectWorktreeByPath(ctx context.Context, repos *storage.Repositories, projectID, path string) (*storage.WorktreeRecord, error) {
+	items, err := repos.Worktrees.ListByProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if items[i].CleanedAt != nil {
+			continue
+		}
+		if sameFilesystemPath(items[i].WorktreePath, path) {
+			return &items[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// findProjectWorktreeByBranch resolves an active worktree row for project+branch.
+// When prNumber is known, refuse rows whose CreateWorktree directory embeds a
+// different pr-<M>: GitHub head branch names are not unique across PRs, and the
+// unique (project_id, branch) index means the stored row may belong to a sibling
+// PR that last claimed the branch. Prefer path/branch markers for pr-<N>.
+func findProjectWorktreeByBranch(ctx context.Context, repos *storage.Repositories, projectID, branch string, prNumber int64) (*storage.WorktreeRecord, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		return nil, nil
+	}
+	items, err := repos.Worktrees.ListByProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	var matches []storage.WorktreeRecord
+	for i := range items {
+		if items[i].CleanedAt != nil {
+			continue
+		}
+		if strings.TrimSpace(items[i].Branch) != branch {
+			continue
+		}
+		matches = append(matches, items[i])
+	}
+	if prNumber <= 0 {
+		return pickUniqueActiveWorktree(matches), nil
+	}
+	var preferred []storage.WorktreeRecord
+	for i := range matches {
+		if worktreeBelongsToPR(matches[i], prNumber) {
+			preferred = append(preferred, matches[i])
+		}
+	}
+	if len(preferred) > 0 {
+		return pickUniqueActiveWorktree(preferred), nil
+	}
+	// Known PR but no row clearly owned by it: do not discard a sibling PR path.
+	return nil, nil
+}
+
+// worktreeBelongsToPR reports whether a worktree row is owned by the given PR.
+// True only when ownership is proven: the directory embeds pr-<N>, or the branch
+// is bare pr-<N> (push-existing). Untagged paths are refused when prNumber is
+// known — RestoreWorktree can adopt a branch checkout without a pr-<N> path, and
+// accepting those would let two PRs that share a head branch name discard each
+// other's untagged worktree.
+func worktreeBelongsToPR(record storage.WorktreeRecord, prNumber int64) bool {
+	if prNumber <= 0 {
+		return true
+	}
+	if worktreePathMatchesPR(record.WorktreePath, prNumber) {
+		return true
+	}
+	if strings.TrimSpace(record.Branch) == fmt.Sprintf("pr-%d", prNumber) {
+		return true
+	}
+	// Known PR scope: untagged or differently-tagged paths cannot prove ownership.
+	return false
+}
+
+// findProjectWorktreeByPR finds the active managed worktree whose path embeds
+// pr-<N>, used when branch lookup is empty or ambiguous but the loop is PR-scoped.
+func findProjectWorktreeByPR(ctx context.Context, repos *storage.Repositories, projectID string, prNumber int64) (*storage.WorktreeRecord, error) {
+	if prNumber <= 0 {
+		return nil, nil
+	}
+	items, err := repos.Worktrees.ListByProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	var matches []storage.WorktreeRecord
+	for i := range items {
+		if items[i].CleanedAt != nil {
+			continue
+		}
+		if worktreePathMatchesPR(items[i].WorktreePath, prNumber) {
+			matches = append(matches, items[i])
+		}
+	}
+	return pickUniqueActiveWorktree(matches), nil
+}
+
+func worktreePathMatchesPR(worktreePath string, prNumber int64) bool {
+	if prNumber <= 0 {
+		return false
+	}
+	base := filepath.Base(strings.TrimSpace(worktreePath))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return false
+	}
+	// CreateWorktree dirs: looper-fix-<project>-pr-<N>[ -detached]
+	// Worker push-existing may also use bare pr-<N>.
+	marker := fmt.Sprintf("-pr-%d", prNumber)
+	if strings.HasSuffix(base, marker) || strings.HasSuffix(base, marker+"-detached") {
+		return true
+	}
+	return base == fmt.Sprintf("pr-%d", prNumber)
+}
+
+func worktreePathHasPRMarker(worktreePath string) bool {
+	_, ok := worktreePathEmbeddedPR(worktreePath)
+	return ok
+}
+
+// worktreePathEmbeddedPR extracts pr-<N> from a CreateWorktree directory base name.
+func worktreePathEmbeddedPR(worktreePath string) (int64, bool) {
+	base := filepath.Base(strings.TrimSpace(worktreePath))
+	if base == "" || base == "." {
+		return 0, false
+	}
+	// Bare pr-<N>
+	var bare int64
+	if _, err := fmt.Sscanf(base, "pr-%d", &bare); err == nil && bare > 0 && base == fmt.Sprintf("pr-%d", bare) {
+		return bare, true
+	}
+	// …-pr-<N> or …-pr-<N>-detached
+	const marker = "-pr-"
+	idx := strings.LastIndex(base, marker)
+	if idx < 0 {
+		return 0, false
+	}
+	rest := base[idx+len(marker):]
+	rest = strings.TrimSuffix(rest, "-detached")
+	var n int64
+	if _, err := fmt.Sscanf(rest, "%d", &n); err != nil || n <= 0 {
+		return 0, false
+	}
+	if rest != fmt.Sprintf("%d", n) {
+		return 0, false
+	}
+	return n, true
+}
+
+func pickUniqueActiveWorktree(matches []storage.WorktreeRecord) *storage.WorktreeRecord {
+	switch len(matches) {
+	case 0:
+		return nil
+	case 1:
+		return &matches[0]
+	default:
+		// Prefer most recently updated among remaining PR-scoped matches.
+		best := 0
+		for i := 1; i < len(matches); i++ {
+			if matches[i].UpdatedAt > matches[best].UpdatedAt {
+				best = i
+			}
+		}
+		return &matches[best]
+	}
+}
+
+func projectWorktreeRoot(project storage.ProjectRecord) (string, error) {
+	if project.MetadataJSON != nil && strings.TrimSpace(*project.MetadataJSON) != "" {
+		var metadata map[string]any
+		if err := json.Unmarshal([]byte(*project.MetadataJSON), &metadata); err == nil {
+			if value, ok := metadata["worktreeRoot"].(string); ok && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value), nil
+			}
+		}
+	}
+	return config.DefaultProjectWorktreeRoot(project.ID, project.RepoPath)
+}
+
+func sameFilesystemPath(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}

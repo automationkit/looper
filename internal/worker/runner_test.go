@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,11 +12,13 @@ import (
 
 	"github.com/nexu-io/looper/internal/config"
 	"github.com/nexu-io/looper/internal/disclosure"
+	"github.com/nexu-io/looper/internal/domain"
 	"github.com/nexu-io/looper/internal/lifecycle"
 	"github.com/nexu-io/looper/internal/loops"
 	"github.com/nexu-io/looper/internal/network/protocol"
 	"github.com/nexu-io/looper/internal/networkpolicy"
 	"github.com/nexu-io/looper/internal/storage"
+	"github.com/nexu-io/looper/internal/worktreesafety"
 )
 
 func TestProcessNextIgnoresOtherQueueTypes(t *testing.T) {
@@ -109,6 +112,220 @@ func TestDiscoverIssuesEnqueuesWorkerReadyAssignedIssue(t *testing.T) {
 	}
 	if loop == nil || loop.Type != "worker" || loop.TargetType != "issue" || loop.TargetID == nil || *loop.TargetID != "issue:acme/looper:46" {
 		t.Fatalf("loop = %#v, want worker issue loop for issue 46", loop)
+	}
+}
+
+func TestDiscoverIssuesSkipsWorkerHoldLabel(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{currentLogin: "octocat", issues: []IssueSummary{{Number: 46, Title: "Implement worker-ready", Assignees: []string{"octocat"}, Labels: []string{"looper:worker-ready", domain.HoldLabelWorker}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"})
+	if err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(result.QueueItems) != 0 || len(result.CreatedLoopIDs) != 0 || result.Skipped != 1 {
+		t.Fatalf("result = %#v, want held issue skipped", result)
+	}
+}
+
+func TestProcessClaimedItemSkipsHeldAutoDiscoveredWorkerIssue(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issueNumber := int64(46)
+	loopTarget := buildIssueTargetID(repo, issueNumber)
+	nowISO := fixture.nowISO()
+	metadataJSON := mustMarshalJSON(map[string]any{"worker": map[string]any{"repo": repo, "executionMode": "create-pr", "issueNumber": issueNumber, "autoDiscovered": true}})
+	if err := fixture.repos.Loops.Upsert(context.Background(), storage.LoopRecord{ID: "loop_worker_hold", Seq: 101, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &loopTarget, Repo: &repo, Status: "queued", MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	projectID := "project_1"
+	loopID := "loop_worker_hold"
+	payloadJSON := mustMarshalJSON(map[string]any{"repo": repo, "executionMode": "create-pr", "issueNumber": issueNumber, "autoDiscovered": true})
+	lockKey := loopTarget
+	if err := fixture.repos.Queue.Upsert(context.Background(), storage.QueueItemRecord{ID: "queue_worker_hold", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: loopTarget, Repo: &repo, DedupeKey: "worker:hold", Priority: storage.QueuePriorityWorker, Status: "running", AvailableAt: nowISO, LockKey: &lockKey, PayloadJSON: &payloadJSON, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: issueNumber, Labels: []string{domain.HoldLabelWorker}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	result, err := runner.ProcessClaimedItem(context.Background(), storage.QueueItemRecord{ID: "queue_worker_hold", ProjectID: &projectID, LoopID: &loopID, Type: "worker", TargetType: "issue", TargetID: loopTarget, Repo: &repo, Status: "running", PayloadJSON: &payloadJSON})
+	if err != nil {
+		t.Fatalf("ProcessClaimedItem() error = %v", err)
+	}
+	if result.Status != "skipped" {
+		t.Fatalf("result = %#v, want skipped", result)
+	}
+}
+
+func TestWorkerHoldSummaryChecksRetargetedPullRequestLabels(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issueNumber := int64(46)
+	prNumber := int64(101)
+	prTarget := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	nowISO := fixture.nowISO()
+	metadataJSON := mustMarshalJSON(map[string]any{"worker": map[string]any{"repo": repo, "executionMode": "create-pr", "issueNumber": issueNumber, "specPath": "specs/worker/spec.md", "autoDiscovered": true}})
+	loop := storage.LoopRecord{ID: "loop_worker_pr_hold", Seq: 102, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &prTarget, Repo: &repo, PRNumber: &prNumber, Status: "queued", MetadataJSON: &metadataJSON, CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_worker_pr_hold", Type: "worker", TargetType: "pull_request", TargetID: prTarget, Repo: &repo, PRNumber: &prNumber, PayloadJSON: &metadataJSON}
+	github := &fakeGitHubGateway{
+		issueDetail: IssueDetail{Number: issueNumber},
+		prDetailResponses: []PullRequestDetail{
+			{Number: prNumber, Title: "Worker PR", BaseRefName: "main", HeadRefName: "worker/46"},
+			{Number: prNumber, Labels: []string{domain.HoldLabelWorker}, BaseRefName: "main", HeadRefName: "worker/46"},
+		},
+	}
+	runner := New(Options{GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	held, summary, err := runner.workerHoldSummary(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, loop, queue, workerCheckpoint{})
+	if err != nil {
+		t.Fatalf("workerHoldSummary() error = %v", err)
+	}
+	if !held || !strings.Contains(summary, "acme/looper#101") {
+		t.Fatalf("held, summary = %v, %q, want held PR summary", held, summary)
+	}
+	if len(github.viewPRCalls) != 2 {
+		t.Fatalf("viewPRCalls = %#v, want resolve lookup plus hold lookup", github.viewPRCalls)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("viewIssueCalls = %#v, want only resolve hydration before held PR check", github.viewIssueCalls)
+	}
+}
+
+func TestWorkerHoldSummaryDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{
+		issueDetail: IssueDetail{Number: 46, Labels: []string{domain.HoldLabelWorker}},
+		prDetail:    PullRequestDetail{Number: 101, Labels: []string{}},
+	}
+	runner := New(Options{GitHub: github, Logger: fixture.logger, Now: fixture.now})
+
+	held, summary, err := runner.workerHoldSummaryForWork(context.Background(), storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()}, workerInput{Repo: "acme/looper", IssueNumber: 46, PRNumber: 101, AutoDiscovered: true}, true)
+	if err != nil {
+		t.Fatalf("workerHoldSummaryForWork() error = %v", err)
+	}
+	if held || summary != "" {
+		t.Fatalf("held, summary = %v, %q, want unheld PR to ignore stale issue hold", held, summary)
+	}
+	if len(github.viewIssueCalls) != 0 {
+		t.Fatalf("viewIssueCalls = %#v, want no issue lookup after PR retarget", github.viewIssueCalls)
+	}
+}
+
+func TestRunPrepareWorkStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issueNumber := int64(46)
+	prNumber := int64(101)
+	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	nowISO := fixture.nowISO()
+	github := &fakeGitHubGateway{
+		issueDetail:          IssueDetail{Number: issueNumber, Labels: []string{domain.HoldLabelWorker}},
+		issueDetailResponses: []IssueDetail{{Number: issueNumber}},
+		prDetail:             PullRequestDetail{Number: prNumber, Labels: []string{}, BaseRefName: "main", HeadRefName: "worker/46"},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Logger: fixture.logger, Now: fixture.now})
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop := storage.LoopRecord{ID: "loop_worker_pr_prepare_hold", Seq: 103, ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", CreatedAt: nowISO, UpdatedAt: nowISO}
+	queue := storage.QueueItemRecord{ID: "queue_worker_pr_prepare_hold", ProjectID: stringPtr("project_1"), LoopID: &loop.ID, Type: "worker", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, Status: "queued", AvailableAt: nowISO, MaxAttempts: 3, CreatedAt: nowISO, UpdatedAt: nowISO}
+	checkpoint := workerCheckpoint{Work: &workerInput{Title: "Stale issue work", Repo: repo, BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: issueNumber, AutoDiscovered: true}}
+
+	_, err = runner.runPrepareWorkStep(context.Background(), stepInput{Project: *project, Loop: loop, QueueItem: queue, Checkpoint: checkpoint})
+	if err != nil {
+		t.Fatalf("runPrepareWorkStep() error = %v", err)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("viewIssueCalls = %#v, want only stale issue validation before PR hold check", github.viewIssueCalls)
+	}
+	if len(github.viewPRCalls) != 1 {
+		t.Fatalf("viewPRCalls = %#v, want PR hold lookup from retargeted loop", github.viewPRCalls)
+	}
+}
+
+func TestRunOpenPRStepSkipsWhenHoldAddedBeforePush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{issueDetail: IssueDetail{Number: 46, Labels: []string{domain.HoldLabelWorker}}}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+	checkpoint, err := runner.runOpenPRStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Checkpoint: workerCheckpoint{
+			Work:       &workerInput{Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: 46, AutoDiscovered: true},
+			Worktree:   &checkpointWorktree{Path: t.TempDir(), Branch: "worker/46", BaseBranch: "main"},
+			Validation: &ValidationResult{Passed: true},
+			Execution:  &checkpointExecution{Status: "completed", ParseStatus: "parsed"},
+			Lifecycle:  lifecycle.NewState(lifecycle.AgentManagedWithFallbackPolicy("worker", true), "worker/46", "main"),
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "currently held") {
+		t.Fatalf("runOpenPRStep() error = %v, want hold skip", err)
+	}
+	if len(git.pushCalls) != 0 {
+		t.Fatalf("pushCalls = %#v, want none", git.pushCalls)
+	}
+	if checkpoint.SkipReason != "" {
+		t.Fatalf("checkpoint = %#v, want unchanged checkpoint before hold handling", checkpoint)
+	}
+}
+
+func TestRunOpenPRStepDoesNotInheritIssueHoldAfterPullRequestRetarget(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repo := "acme/looper"
+	issueNumber := int64(46)
+	prNumber := int64(101)
+	targetID := fmt.Sprintf("pr:%s:%d", repo, prNumber)
+	github := &fakeGitHubGateway{
+		issueDetail: IssueDetail{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		prDetail:    PullRequestDetail{Number: prNumber, State: "open", Labels: []string{}},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, Logger: fixture.logger, Now: fixture.now, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+	loop := storage.LoopRecord{ID: "loop_worker_pr_open_hold", ProjectID: "project_1", Type: "worker", TargetType: "pull_request", TargetID: &targetID, Repo: &repo, PRNumber: &prNumber, Status: "running", CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	projectID := "project_1"
+	queue := storage.QueueItemRecord{ID: "queue_worker_pr_open_hold", ProjectID: &projectID, LoopID: &loop.ID, Type: "worker", TargetType: "pull_request", TargetID: targetID, Repo: &repo, PRNumber: &prNumber, DedupeKey: "worker:acme/looper:101", Status: "running", Priority: storage.QueuePriorityWorker, MaxAttempts: 3, AvailableAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Queue.Upsert(context.Background(), queue); err != nil {
+		t.Fatalf("Queue.Upsert() error = %v", err)
+	}
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{ID: "run_worker_pr_open_hold", LoopID: "loop_worker_1", Status: "running", StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+
+	checkpoint, err := runner.runOpenPRStep(context.Background(), stepInput{
+		Project:   storage.ProjectRecord{ID: "project_1", RepoPath: t.TempDir()},
+		Loop:      loop,
+		QueueItem: queue,
+		Run:       storage.RunRecord{ID: "run_worker_pr_open_hold"},
+		Checkpoint: workerCheckpoint{
+			Work:        &workerInput{Repo: repo, BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: issueNumber, PRNumber: prNumber, AutoDiscovered: true},
+			Worktree:    &checkpointWorktree{Path: t.TempDir(), Branch: "worker/46", BaseBranch: "main"},
+			Validation:  &ValidationResult{Passed: true},
+			PullRequest: &checkpointPullPR{Number: prNumber, URL: "https://example/pr/101"},
+			Lifecycle:   &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: "worker/46", BaseBranch: "main", Pushed: true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runOpenPRStep() error = %v", err)
+	}
+	if checkpoint.ResumePolicy != loops.ResumePolicyAdvanceFromCheckpoint {
+		t.Fatalf("checkpoint.ResumePolicy = %q, want advance after PR persistence", checkpoint.ResumePolicy)
+	}
+	if len(github.viewPRCalls) != 4 {
+		t.Fatalf("viewPRCalls = %#v, want all open-pr hold checks to target PR", github.viewPRCalls)
+	}
+	if len(github.viewIssueCalls) != 1 {
+		t.Fatalf("viewIssueCalls = %#v, want only issue-open validation and no stale issue hold lookup", github.viewIssueCalls)
 	}
 }
 
@@ -314,6 +531,54 @@ func TestDiscoverIssuesRoutedProjectCombinesTargetLabelWithAnyTriggerQueries(t *
 		if len(got) != 2 || got[0] != protocol.TargetLabelForNode("worker-1") || got[1] != want {
 			t.Fatalf("listIssueCalls[%d].Labels = %#v, want target + %q", i, got, want)
 		}
+	}
+}
+
+func TestDiscoverIssuesScopesPlaneWorkItemsToConfiguredAssigneeUUID(t *testing.T) {
+	t.Parallel()
+	const planeUUID = "11111111-2222-3333-4444-555555555555"
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "plane-open-design", Kind: config.ProviderKindPlane}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "plane-open-design", Repo: "acme/looper"}}
+	fixture.cfg.Roles.Worker.AutoDiscovery = true
+	fixture.cfg.Roles.Worker.Triggers.Labels = []string{"looper:plan"}
+	fixture.cfg.Roles.Worker.Triggers.LabelMode = config.LabelModeAll
+	fixture.cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = false
+	fixture.cfg.Roles.Worker.Triggers.PlaneAssigneeID = planeUUID
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 7, Title: "Plane item", Labels: []string{"looper:plan"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(github.listIssueCalls) == 0 {
+		t.Fatalf("no ListOpenIssues call recorded")
+	}
+	if got := github.listIssueCalls[0].Assignee; got != planeUUID {
+		t.Fatalf("ListOpenIssues Assignee = %q, want the configured Plane UUID %q", got, planeUUID)
+	}
+}
+
+func TestDiscoverIssuesPlaneWithoutAssigneeUUIDStaysLabelOnly(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "plane-open-design", Kind: config.ProviderKindPlane}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "plane-open-design", Repo: "acme/looper"}}
+	fixture.cfg.Roles.Worker.AutoDiscovery = true
+	fixture.cfg.Roles.Worker.Triggers.Labels = []string{"looper:plan"}
+	fixture.cfg.Roles.Worker.Triggers.LabelMode = config.LabelModeAll
+	fixture.cfg.Roles.Worker.Triggers.RequireAssigneeCurrentUser = false
+	github := &fakeGitHubGateway{issues: []IssueSummary{{Number: 7, Title: "Plane item", Labels: []string{"looper:plan"}}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	if _, err := runner.DiscoverIssues(context.Background(), DiscoveryInput{ProjectID: "project_1", Repo: "acme/looper"}); err != nil {
+		t.Fatalf("DiscoverIssues() error = %v", err)
+	}
+	if len(github.listIssueCalls) == 0 {
+		t.Fatalf("no ListOpenIssues call recorded")
+	}
+	if got := github.listIssueCalls[0].Assignee; got != "" {
+		t.Fatalf("ListOpenIssues Assignee = %q, want empty (label-only) when no Plane UUID configured", got)
 	}
 }
 
@@ -548,7 +813,7 @@ func TestProcessClaimedItemCompletesCreatePRFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Queue.GetByID() error = %v", err)
 	}
-	if queue == nil || queue.TargetType != "pull_request" || queue.TargetID != "pr:acme/looper:101" || queue.LockKey == nil || *queue.LockKey != "pr:acme/looper:101" || queue.PRNumber == nil || *queue.PRNumber != 101 {
+	if queue == nil || queue.TargetType != "pull_request" || queue.TargetID != "pr:acme/looper:101" || queue.LockKey == nil || *queue.LockKey != storage.PullRequestLockKey("project_1", "acme/looper", 101) || queue.PRNumber == nil || *queue.PRNumber != 101 {
 		t.Fatalf("queue = %#v, want retargeted queue item", queue)
 	}
 	run, err := fixture.repos.Runs.GetByID(context.Background(), result.RunID)
@@ -892,6 +1157,80 @@ func TestRunExecuteStepRecoversStaleWorktreePathBeforeAgentStart(t *testing.T) {
 	}
 }
 
+func TestRunExecuteStepSkipsWhenWorkerHoldAppliedBeforeAgentStart(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{prDetail: PullRequestDetail{Number: 42, Labels: []string{domain.HoldLabelWorker}}}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_execute_hold", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	_, err = runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project,
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", PRNumber: 42, BaseBranch: "main", ExecutionMode: "push-existing", AutoDiscovered: true},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runExecuteStep() error = %v, want hold skip", err)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("len(agent.starts) = %d, want no agent start", len(agent.starts))
+	}
+}
+
+func TestRunExecuteStepRechecksWorkerHoldAfterAgentCompletion(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	github := &fakeGitHubGateway{prDetailResponses: []PullRequestDetail{{Number: 42}, {Number: 42, Labels: []string{domain.HoldLabelWorker}}}}
+	git := &fakeGitGateway{inspectResult: InspectHeadResult{HasUncommittedChanges: true}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_execute_hold_after_agent", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	_, err = runner.runExecuteStep(context.Background(), stepInput{
+		Project: *project, Loop: *loop, Run: run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", PRNumber: 42, BaseBranch: "main", ExecutionMode: "push-existing", AutoDiscovered: true},
+			Worktree: &checkpointWorktree{Path: t.TempDir(), Branch: "looper/feature", BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runExecuteStep() error = %v, want holdSkipError", err)
+	}
+	if len(git.inspectCalls) != 0 || len(git.commitCalls) != 0 {
+		t.Fatalf("git reconciliation calls = inspect %d, commit %d; want none", len(git.inspectCalls), len(git.commitCalls))
+	}
+}
+
 func TestRunExecuteStepRecoversWorktreeOutsideWorktreeRootBeforeAgentStart(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -937,6 +1276,395 @@ func TestRunExecuteStepRecoversWorktreeOutsideWorktreeRootBeforeAgentStart(t *te
 	}
 	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recoveredPath {
 		t.Fatalf("agent starts = %#v, want recovered working directory", agent.starts)
+	}
+}
+
+// Post-prepare resume at execute must share LocalCheckoutUsable with prepare:
+// a path under the managed worktree root that still has a .git entry must not
+// skip recovery when that entry is malformed or linked metadata is corrupt.
+func TestRunExecuteStepRecoversMalformedGitCheckoutAfterPrepare(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	// Checkpoint worktree from a prior prepare: path exists under root, and .git
+	// is present but unusable (malformed gitfile — the pre-fix existence check
+	// would have accepted this and failed later under an external step boundary).
+	corruptPath := filepath.Join(worktreeRoot, "worker-wt")
+	if err := os.MkdirAll(corruptPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll corruptPath: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, ".git"), []byte("not-a-valid-gitfile\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformed .git: %v", err)
+	}
+	if worktreesafety.LocalCheckoutUsable(corruptPath) {
+		t.Fatal("LocalCheckoutUsable(corruptPath) = true, want false for malformed gitfile")
+	}
+	recoveredPath := filepath.Join(worktreeRoot, "recovered")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/feature"
+	git := &fakeGitGateway{
+		restoreResult: &RestoreWorktreeResult{WorktreePath: recoveredPath, Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_recovered"},
+		inspectResult: InspectHeadResult{HeadSHA: "def456"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_malformed_git_resume", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: corruptPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recoveredPath || checkpoint.Worktree.ID != "worktree_recovered" {
+		t.Fatalf("checkpoint.Worktree = %#v, want recovered worktree after malformed .git", checkpoint.Worktree)
+	}
+	if len(git.restoreCalls) != 1 || git.restoreCalls[0].ExpectedWorktreePath != corruptPath || git.restoreCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("restoreCalls = %#v, want recovery of malformed managed worktree", git.restoreCalls)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recoveredPath {
+		t.Fatalf("agent starts = %#v, want recovered working directory", agent.starts)
+	}
+	persisted, err := fixture.repos.Runs.GetByID(context.Background(), run.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("Runs.GetByID() = (%#v, %v), want persisted run", persisted, err)
+	}
+	persistedCheckpoint, err := parseCheckpoint(persisted.CheckpointJSON)
+	if err != nil {
+		t.Fatalf("parseCheckpoint() error = %v", err)
+	}
+	if persistedCheckpoint.Worktree == nil || persistedCheckpoint.Worktree.Path != recoveredPath {
+		t.Fatalf("persisted checkpoint worktree = %#v, want recovered path", persistedCheckpoint.Worktree)
+	}
+}
+
+// Resumed post-prepare steps must not recreate when the checkpoint worktree is
+// the project repo itself. Create-after-restore-nil is for hollow managed
+// paths under the worktree root; inventing a fresh path would let validate /
+// open_pr succeed after a corrupt "ran in user repo" checkpoint.
+func TestRunValidateStepRejectsCheckpointWorktreePathAtUserRepo(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/bad-checkpoint"
+	git := &fakeGitGateway{
+		restoreNil:   true,
+		createResult: CreateWorktreeResult{WorktreePath: filepath.Join(worktreeRoot, "recreated"), Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_created"},
+	}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	_, err = runner.runValidateStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     storage.RunRecord{ID: "run_bad_repo_checkpoint", LoopID: loop.ID},
+		Checkpoint: workerCheckpoint{
+			Work:      &workerInput{Title: "Reject unsafe worktree checkpoint", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree:  &checkpointWorktree{ID: "worktree_bad", Path: repoPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:      &checkpointPlan{Summary: "Reject unsafe worktree checkpoint", Items: []string{"Never use the user repo as worker cwd"}},
+			Execution: &checkpointExecution{Status: "completed", Summary: "prior execution completed", ParseStatus: "parsed"},
+		},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("runValidateStep() error = %v, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if !strings.Contains(loopErr.message, "Worker worktree path") {
+		t.Fatalf("error = %q, want Worker worktree path rejection", loopErr.message)
+	}
+	if !strings.Contains(loopErr.message, "must not equal project repo path") {
+		t.Fatalf("error = %q, want project-repo-path detail", loopErr.message)
+	}
+	if len(git.restoreCalls) != 0 {
+		t.Fatalf("restoreCalls = %#v, want no restore for project-repo checkpoint", git.restoreCalls)
+	}
+	if len(git.createCalls) != 0 {
+		t.Fatalf("createCalls = %#v, want no recreate for project-repo checkpoint", git.createCalls)
+	}
+}
+
+// Production RestoreWorktree clears empty/metadata-only hollow leftovers and
+// returns (nil, nil) when no healthy registered worktree remains. Recovery must
+// fall through to CreateWorktree instead of parking as stale-worktree MI.
+func TestRunExecuteStepRecreatesAfterRestoreReturnsNil(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	corruptPath := filepath.Join(worktreeRoot, "hollow-wt")
+	if err := os.MkdirAll(corruptPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll corruptPath: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, ".git"), []byte("gitdir: /missing/gitdir\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformed .git: %v", err)
+	}
+	recreatedPath := filepath.Join(worktreeRoot, "recreated")
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/feature"
+	git := &fakeGitGateway{
+		restoreNil:    true,
+		createResult:  CreateWorktreeResult{WorktreePath: recreatedPath, Branch: branch, BaseBranch: "main", HeadSHA: "def456", WorktreeID: "worktree_created"},
+		inspectResult: InspectHeadResult{HeadSHA: "def456"},
+	}
+	agent := &fakeAgentExecutor{results: []AgentResult{{Status: "completed", Summary: "done", ParseStatus: "parsed"}}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_restore_nil_recreate", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	checkpoint, err := runner.runExecuteStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: corruptPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("runExecuteStep() error = %v", err)
+	}
+	if checkpoint.Worktree == nil || checkpoint.Worktree.Path != recreatedPath || checkpoint.Worktree.ID != "worktree_created" {
+		t.Fatalf("checkpoint.Worktree = %#v, want recreated worktree after restore nil", checkpoint.Worktree)
+	}
+	if len(git.restoreCalls) != 1 {
+		t.Fatalf("restoreCalls = %#v, want 1", git.restoreCalls)
+	}
+	if len(git.createCalls) != 1 || git.createCalls[0].Branch != branch || git.createCalls[0].WorktreeRoot != worktreeRoot {
+		t.Fatalf("createCalls = %#v, want CreateWorktree fallback after restore nil", git.createCalls)
+	}
+	if len(agent.starts) != 1 || agent.starts[0].WorkingDirectory != recreatedPath {
+		t.Fatalf("agent starts = %#v, want recreated working directory", agent.starts)
+	}
+}
+
+// Production RestoreWorktree preserves populated unusable paths and returns
+// ErrUnusableWorktreePreserved. Recovery must park as FailureManualIntervention
+// so unlimited queues cannot infinite-retry.
+func TestRunExecuteStepParksPreservedUnusableWorktreeAsManualIntervention(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	repoPath := t.TempDir()
+	worktreeRoot := filepath.Join(t.TempDir(), "worktrees")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll worktreeRoot: %v", err)
+	}
+	corruptPath := filepath.Join(worktreeRoot, "populated-hollow")
+	if err := os.MkdirAll(corruptPath, 0o755); err != nil {
+		t.Fatalf("MkdirAll corruptPath: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, ".git"), []byte("gitdir: /missing/gitdir\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile malformed .git: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptPath, "agent-output.txt"), []byte("keep me\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile agent-output: %v", err)
+	}
+	metadata := fmt.Sprintf(`{"worktreeRoot":%q}`, worktreeRoot)
+	branch := "looper/feature"
+	preservedErr := fmt.Errorf("worktree path %s is unusable and not empty; manual intervention required: %w", corruptPath, worktreesafety.ErrUnusableWorktreePreserved)
+	git := &fakeGitGateway{restoreErr: preservedErr}
+	agent := &fakeAgentExecutor{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, Git: git, AgentExecutor: agent, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true})
+	run := storage.RunRecord{ID: "run_preserve_mi", LoopID: "loop_worker_1", Status: "running", CurrentStep: stringPtr(string(stepExecute)), StartedAt: fixture.nowISO(), CreatedAt: fixture.nowISO(), UpdatedAt: fixture.nowISO()}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v), want loop", loop, err)
+	}
+
+	_, err = runner.runExecuteStep(context.Background(), stepInput{
+		Project: storage.ProjectRecord{ID: "project_1", RepoPath: repoPath, MetadataJSON: &metadata},
+		Loop:    *loop,
+		Run:     run,
+		Checkpoint: workerCheckpoint{
+			Work:     &workerInput{Title: "Implement worker loop", Repo: "acme/looper", IssueNumber: 27, BaseBranch: "main", ExecutionMode: "create-pr"},
+			Worktree: &checkpointWorktree{ID: "worktree_old", Path: corruptPath, Branch: branch, BaseBranch: "main", HeadSHA: "abc123"},
+			Plan:     &checkpointPlan{Summary: "Implement worker loop", Items: []string{"Do it"}},
+		},
+	})
+	var loopErr *loopError
+	if !errors.As(err, &loopErr) {
+		t.Fatalf("runExecuteStep() error = %v, want *loopError", err)
+	}
+	if loopErr.kind != FailureManualIntervention {
+		t.Fatalf("loopErr.kind = %v, want %v", loopErr.kind, FailureManualIntervention)
+	}
+	if !errors.Is(err, worktreesafety.ErrUnusableWorktreePreserved) && !strings.Contains(loopErr.message, "manual intervention required") {
+		t.Fatalf("error = %q, want preserved unusable worktree message", loopErr.message)
+	}
+	if len(git.restoreCalls) != 1 {
+		t.Fatalf("restoreCalls = %#v, want 1", git.restoreCalls)
+	}
+	if len(git.createCalls) != 0 {
+		t.Fatalf("createCalls = %#v, want 0 (must not recreate preserved path)", git.createCalls)
+	}
+	if len(agent.starts) != 0 {
+		t.Fatalf("agent starts = %#v, want none", agent.starts)
+	}
+	// Queue classification must park under unlimited maxAttempts.
+	if shouldRetryQueueFailure(loopErr.kind, 242, -1) {
+		t.Fatal("preserved unusable worktree must not requeue under unlimited maxAttempts")
+	}
+	got, readErr := os.ReadFile(filepath.Join(corruptPath, "agent-output.txt"))
+	if readErr != nil || string(got) != "keep me\n" {
+		t.Fatalf("agent-output = %q err=%v, want preserved", got, readErr)
+	}
+}
+
+func TestCreateRunContextCopiesPredecessorAgentSnapshotOnResume(t *testing.T) {
+	t.Parallel()
+
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"codex","model":"sticky-model","profileId":"sticky-profile"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorClaudeCode),
+		AgentModel:     stringPtr("new-model"),
+		AgentProfileID: "new-profile",
+	})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Title: "Worker task"},
+		ClaimedLockKey: "worker:loop_worker_1",
+		Worktree:       &checkpointWorktree{ID: "wt_1", Path: filepath.Join(t.TempDir(), "wt"), Branch: "feature/test"},
+		Plan:           &checkpointPlan{Summary: "plan"},
+		Execution:      &checkpointExecution{Status: "completed", Summary: "upstream server_error"},
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_with_snapshot",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepValidate)),
+		LastCompletedStep: stringPtr(string(stepExecute)),
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil {
+		t.Fatalf("Loops.GetByID() error = %v", err)
+	}
+	if loop == nil {
+		t.Fatal("loop = nil")
+	}
+
+	resumed, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if !resumed.Resumed {
+		t.Fatal("Resumed = false, want true")
+	}
+	if resumed.Run.AgentSnapshotJSON == nil || *resumed.Run.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("AgentSnapshotJSON = %#v, want predecessor %q", resumed.Run.AgentSnapshotJSON, predecessorSnapshot)
+	}
+	persisted, err := fixture.repos.Runs.GetByID(context.Background(), resumed.Run.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+	if persisted == nil || persisted.AgentSnapshotJSON == nil || *persisted.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("persisted AgentSnapshotJSON = %#v, want predecessor", persisted)
+	}
+}
+
+func TestCreateRunContextCopiesPredecessorAgentSnapshotOnFirstStepRetry(t *testing.T) {
+	t.Parallel()
+
+	// Failed run that restarts at prepare_work (first step) must still copy the
+	// predecessor snapshot — sticky across any failed/interrupted lineage.
+	fixture := newRunnerFixture(t)
+	predecessorSnapshot := `{"vendor":"codex","model":"sticky-first-step","profileId":"sticky-profile"}`
+	runner := New(Options{
+		DB:             fixture.coordinator.DB(),
+		Repos:          fixture.repos,
+		Logger:         fixture.logger,
+		Now:            fixture.now,
+		AgentRuntime:   string(config.AgentVendorClaudeCode),
+		AgentModel:     stringPtr("new-model"),
+		AgentProfileID: "new-profile",
+	})
+	checkpointJSON := mustMarshalJSON(workerCheckpoint{
+		Work:           &workerInput{Title: "Worker task"},
+		ClaimedLockKey: "worker:loop_worker_1",
+		ResumePolicy:   loops.ResumePolicyReplayStep,
+	})
+	if err := fixture.repos.Runs.Upsert(context.Background(), storage.RunRecord{
+		ID:                "run_failed_at_prepare",
+		LoopID:            "loop_worker_1",
+		Status:            "failed",
+		CurrentStep:       stringPtr(string(stepPrepareWork)),
+		LastCompletedStep: nil,
+		CheckpointJSON:    &checkpointJSON,
+		AgentSnapshotJSON: &predecessorSnapshot,
+		StartedAt:         fixture.nowISO(),
+		CreatedAt:         fixture.nowISO(),
+		UpdatedAt:         fixture.nowISO(),
+	}); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	loop, err := fixture.repos.Loops.GetByID(context.Background(), "loop_worker_1")
+	if err != nil || loop == nil {
+		t.Fatalf("Loops.GetByID() = (%#v, %v)", loop, err)
+	}
+
+	created, err := runner.createRunContext(context.Background(), *loop)
+	if err != nil {
+		t.Fatalf("createRunContext() error = %v", err)
+	}
+	if created.Resumed {
+		t.Fatal("Resumed = true, want false for first-step restart")
+	}
+	if created.StartStep != stepPrepareWork {
+		t.Fatalf("StartStep = %q, want prepare_work", created.StartStep)
+	}
+	if created.Run.AgentSnapshotJSON == nil || *created.Run.AgentSnapshotJSON != predecessorSnapshot {
+		t.Fatalf("AgentSnapshotJSON = %#v, want predecessor %q", created.Run.AgentSnapshotJSON, predecessorSnapshot)
 	}
 }
 
@@ -1492,7 +2220,7 @@ func TestProcessClaimedItemKeepsIssueLockKeyWhileRetargetingWorkerToPullRequest(
 	if err != nil {
 		t.Fatalf("Queue.GetByID() after run error = %v", err)
 	}
-	if updatedQueue == nil || updatedQueue.TargetType != "pull_request" || updatedQueue.TargetID != "pr:acme/looper:101" || updatedQueue.LockKey == nil || *updatedQueue.LockKey != "pr:acme/looper:101" {
+	if updatedQueue == nil || updatedQueue.TargetType != "pull_request" || updatedQueue.TargetID != "pr:acme/looper:101" || updatedQueue.LockKey == nil || *updatedQueue.LockKey != storage.PullRequestLockKey("project_1", "acme/looper", 101) {
 		t.Fatalf("queue = %#v, want retargeted queue item with persisted PR lock key", updatedQueue)
 	}
 	latestRun, err := fixture.repos.Runs.GetLatestByLoopID(context.Background(), "loop_worker_1")
@@ -1506,7 +2234,7 @@ func TestProcessClaimedItemKeepsIssueLockKeyWhileRetargetingWorkerToPullRequest(
 	if err != nil {
 		t.Fatalf("parseCheckpoint(latestRun) error = %v", err)
 	}
-	if latestCheckpoint.ClaimedLockKey != "pr:acme/looper:101" {
+	if latestCheckpoint.ClaimedLockKey != storage.PullRequestLockKey("project_1", "acme/looper", 101) {
 		t.Fatalf("checkpoint.ClaimedLockKey = %q, want pr:acme/looper:101", latestCheckpoint.ClaimedLockKey)
 	}
 	issueLock, err := fixture.repos.Locks.Get(context.Background(), issueTarget)
@@ -2099,6 +2827,60 @@ func TestProcessClaimedItemSelfAssignsIssue(t *testing.T) {
 	}
 }
 
+func TestProcessClaimedItemGitHubAppSkipsSelfAssign(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Repo: "acme/looper", Identity: "worker-bot"}}
+	fixture.cfg.Identities = map[string]config.HostingIdentityConfig{"worker-bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: "/not-read-by-fake-transports.pem"}}
+	github := &fakeGitHubGateway{currentLogin: "looper-sandbox-e2e[bot]", issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open"}, addAssigneeErr: fmt.Errorf("Forbidden (HTTP 403)")}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status == "failed" {
+		t.Fatalf("result = %#v, want GitHub App worker to continue without self-assignment", result)
+	}
+	if len(github.addAssigneeCalls) != 0 {
+		t.Fatalf("addAssigneeCalls = %#v, want no GitHub App self-assignment", github.addAssigneeCalls)
+	}
+}
+
+func TestProcessClaimedItemGitHubAppPlaneStillSelfAssigns(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	fixture.cfg.Providers = []config.ProviderConfig{{ID: "plane-open-design", Kind: config.ProviderKindPlane}}
+	fixture.cfg.Projects = []config.ProjectRefConfig{{ID: "project_1", Provider: "plane-open-design", Repo: "acme/looper", Identity: "worker-bot"}}
+	fixture.cfg.Identities = map[string]config.HostingIdentityConfig{"worker-bot": {Kind: config.HostingIdentityGitHubApp, AppID: 1, InstallationID: 2, PrivateKeyFile: "/not-read-by-fake-transports.pem"}}
+	const planeLogin = "11111111-2222-3333-4444-555555555555"
+	github := &fakeGitHubGateway{currentLogin: planeLogin, issueDetail: IssueDetail{Number: 27, Title: "Implement worker loop", State: "open"}}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now, CustomInstructions: fixture.cfg})
+
+	claim, err := fixture.repos.Queue.ClaimNextOfType(context.Background(), fixture.nowISO(), "worker-1", "worker")
+	if err != nil || claim == nil {
+		t.Fatalf("ClaimNextOfType() = (%#v, %v), want claimed item", claim, err)
+	}
+	result, err := runner.ProcessClaimedQueueItem(context.Background(), *claim)
+	if err != nil {
+		t.Fatalf("ProcessClaimedQueueItem() error = %v", err)
+	}
+	if result == nil || result.Status == "failed" {
+		t.Fatalf("result = %#v, want Plane assignment to proceed under a GitHub App identity", result)
+	}
+	if len(github.addAssigneeCalls) != 1 {
+		t.Fatalf("addAssigneeCalls = %#v, want Plane self-assignment despite GitHub App hosting identity", github.addAssigneeCalls)
+	}
+	call := github.addAssigneeCalls[0]
+	if call.IssueNumber != 27 || len(call.Assignees) != 1 || call.Assignees[0] != planeLogin {
+		t.Fatalf("add assignee call = %#v, want Plane login on issue 27", call)
+	}
+}
+
 func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyDisabled(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -2124,6 +2906,131 @@ func TestProcessClaimedItemAutoDiscoveredIssueSkipsSelfAssignWhenAssigneePolicyD
 	}
 	if len(github.addAssigneeCalls) != 0 {
 		t.Fatalf("addAssigneeCalls = %#v, want no self-assignment", github.addAssigneeCalls)
+	}
+}
+
+func TestEnsureLoopForDiscoveredIssueInheritsPlannerSpecPullRequest(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	plannerTargetID := "issue:acme/looper:52"
+	plannerMeta := `{"specPath":"specs/52.md","prNumber":42}`
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_planner_1", Seq: 2, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &plannerTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "completed", MetadataJSON: &plannerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshotPayload := `{"detail":{"state":"open"}}`
+	if err := fixture.repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, PayloadJSON: &snapshotPayload, CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(ctx, *project, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	if !loopResult.created || loop.TargetType != "pull_request" || derefString(loop.TargetID) != "pr:acme/looper:42" || derefInt64(loop.PRNumber) != 42 {
+		t.Fatalf("loop = %#v (created=%v), want new pull_request loop targeting pr:acme/looper:42", loop, loopResult.created)
+	}
+	queueItem, err := runner.enqueueDiscoveredIssue(ctx, *project, loop, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("enqueueDiscoveredIssue() error = %v", err)
+	}
+	if queueItem.TargetType != "pull_request" || queueItem.TargetID != "pr:acme/looper:42" || derefInt64(queueItem.PRNumber) != 42 {
+		t.Fatalf("queueItem target = %s %s pr=%v, want pull_request pr:acme/looper:42", queueItem.TargetType, queueItem.TargetID, queueItem.PRNumber)
+	}
+	if queueItem.DedupeKey != "worker:project_1:acme/looper:42" || derefString(queueItem.LockKey) != storage.PullRequestLockKey("project_1", "acme/looper", 42) {
+		t.Fatalf("queueItem dedupe/lock = %q/%q, want PR-scoped keys", queueItem.DedupeKey, derefString(queueItem.LockKey))
+	}
+	payload := parseJSONObject(queueItem.PayloadJSON)
+	if stringFromAnyDefault(payload["specPath"]) != "specs/52.md" || int64FromAny(payload["prNumber"]) != 42 || stringFromAnyDefault(payload["executionMode"]) != "push-existing" || int64FromAny(payload["issueNumber"]) != 52 {
+		t.Fatalf("payload = %s, want specPath/prNumber/push-existing inherited from planner", derefString(queueItem.PayloadJSON))
+	}
+}
+
+func TestEnsureLoopForDiscoveredIssueKeepsIssueTargetWhenPlannerPRClosed(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	plannerTargetID := "issue:acme/looper:52"
+	plannerMeta := `{"specPath":"specs/52.md","prNumber":42}`
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_planner_1", Seq: 2, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &plannerTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "completed", MetadataJSON: &plannerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshotPayload := `{"detail":{"state":"closed"}}`
+	if err := fixture.repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, PayloadJSON: &snapshotPayload, CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(ctx, *project, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	if !loopResult.created || loop.TargetType != "issue" || derefString(loop.TargetID) != "issue:acme/looper:52" || loop.PRNumber != nil {
+		t.Fatalf("loop = %#v (created=%v), want new issue loop without prNumber", loop, loopResult.created)
+	}
+	workerMeta, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+	if stringFromAnyDefault(workerMeta["specPath"]) != "specs/52.md" {
+		t.Fatalf("worker metadata = %s, want inherited specPath", derefString(loop.MetadataJSON))
+	}
+}
+
+func TestEnsureLoopForDiscoveredIssueMergesSpecPathIntoExistingIssueLoop(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: &fakeGitHubGateway{}, Git: &fakeGitGateway{}, AgentExecutor: &fakeAgentExecutor{}, Logger: fixture.logger, Now: fixture.now})
+	ctx := context.Background()
+	project, err := fixture.repos.Projects.GetByID(ctx, "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	nowISO := fixture.nowISO()
+	issueTargetID := "issue:acme/looper:52"
+	existingMeta := `{"worker":{"title":"Implement worker loop","repo":"acme/looper","issueNumber":52,"baseBranch":"main","executionMode":"create-pr"}}`
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_worker_52", Seq: 2, ProjectID: "project_1", Type: "worker", TargetType: "issue", TargetID: &issueTargetID, Repo: stringPtr("acme/looper"), Status: "queued", MetadataJSON: &existingMeta, NextRunAt: &nowISO, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	plannerMeta := `{"specPath":"specs/52.md","prNumber":42}`
+	prNumber := int64(42)
+	if err := fixture.repos.Loops.Upsert(ctx, storage.LoopRecord{ID: "loop_planner_1", Seq: 3, ProjectID: "project_1", Type: "planner", TargetType: "issue", TargetID: &issueTargetID, Repo: stringPtr("acme/looper"), PRNumber: &prNumber, Status: "completed", MetadataJSON: &plannerMeta, CreatedAt: nowISO, UpdatedAt: nowISO}); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	snapshotPayload := `{"detail":{"state":"open"}}`
+	if err := fixture.repos.PullRequestSnapshots.Upsert(ctx, storage.PullRequestSnapshotRecord{ID: "snapshot_1", ProjectID: "project_1", Repo: "acme/looper", PRNumber: 42, PayloadJSON: &snapshotPayload, CapturedAt: nowISO, CreatedAt: nowISO}); err != nil {
+		t.Fatalf("PullRequestSnapshots.Upsert() error = %v", err)
+	}
+	issue := IssueSummary{Number: 52, Title: "Implement worker loop", URL: "https://example/issues/52", Labels: []string{"looper:worker-ready"}}
+	fingerprint := buildWorkerDiscoveryFingerprint("acme/looper", derefString(project.BaseBranch), issue)
+	loopResult, err := runner.ensureLoopForDiscoveredIssue(ctx, *project, "acme/looper", issue, fingerprint)
+	if err != nil {
+		t.Fatalf("ensureLoopForDiscoveredIssue() error = %v", err)
+	}
+	loop := loopResult.record
+	if loopResult.created || loop.TargetType != "issue" || loop.PRNumber != nil {
+		t.Fatalf("loop = %#v (created=%v), want existing issue loop kept on issue target", loop, loopResult.created)
+	}
+	workerMeta, _ := parseJSONObject(loop.MetadataJSON)["worker"].(map[string]any)
+	if stringFromAnyDefault(workerMeta["specPath"]) != "specs/52.md" {
+		t.Fatalf("worker metadata = %s, want merged specPath", derefString(loop.MetadataJSON))
+	}
+	if int64FromAny(workerMeta["prNumber"]) != 0 {
+		t.Fatalf("worker metadata = %s, want no prNumber on issue-targeted loop", derefString(loop.MetadataJSON))
 	}
 }
 
@@ -3274,6 +4181,336 @@ func TestRunOpenPRStepPushesWhenFallbackCommitCreatedAndLifecycleAlreadyPushed(t
 	}
 }
 
+func TestRunOpenPRStepStopsCreatePRSideEffectsWhenHeldAfterFallbackPush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	prNumber := int64(560)
+	issueNumber := int64(46)
+	github := &fakeGitHubGateway{issueDetailResponses: []IssueDetail{
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+	}}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	now := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_worker_560", ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_worker_560", LoopID: loop.ID, Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:        &workerInput{Title: "Post-push hold", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-560", IssueNumber: issueNumber, AutoDiscovered: true},
+		Worktree:    &checkpointWorktree{Branch: "feature/pr-560", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_560"},
+		PullRequest: &checkpointPullPR{Number: prNumber, URL: "https://example/pr/560"},
+		Validation:  &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle:   &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: "feature/pr-560", BaseBranch: "main"},
+	}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), stepInput{Project: *project, Loop: loop, Run: run, Checkpoint: checkpoint})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runOpenPRStep() error = %v, want hold skip", err)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want fallback push", len(git.pushCalls))
+	}
+	if checkpointAfter.Lifecycle == nil || !checkpointAfter.Lifecycle.Pushed || checkpointAfter.Lifecycle.Actions.Push != lifecycle.ActionSourceFallback {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want pushed fallback lifecycle", checkpointAfter.Lifecycle)
+	}
+	if len(github.updatePRBodyCalls) != 0 || len(github.reviewerCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls/reviewerCalls = %d/%d, want no PR-side mutations after hold", len(github.updatePRBodyCalls), len(github.reviewerCalls))
+	}
+}
+
+func TestRunOpenPRStepStopsPushExistingSideEffectsWhenHeldAfterPush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	prNumber := int64(561)
+	issueNumber := int64(47)
+	github := &fakeGitHubGateway{issueDetailResponses: []IssueDetail{
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+	}}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	now := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_worker_561", ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_worker_561", LoopID: loop.ID, Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Post-push existing hold", ExecutionMode: "push-existing", Repo: "acme/looper", BaseBranch: "main", PRNumber: prNumber, Branch: "feature/pr-561", IssueNumber: issueNumber, AutoDiscovered: true, Reviewers: []string{"octocat"}},
+		Worktree:   &checkpointWorktree{Branch: "feature/pr-561", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_561"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle:  &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: "feature/pr-561", BaseBranch: "main"},
+	}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), stepInput{Project: *project, Loop: loop, Run: run, Checkpoint: checkpoint})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runOpenPRStep() error = %v, want hold skip", err)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want push", len(git.pushCalls))
+	}
+	if checkpointAfter.Lifecycle == nil || !checkpointAfter.Lifecycle.Pushed || checkpointAfter.Lifecycle.Actions.Push != lifecycle.ActionSourceFallback {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want pushed fallback lifecycle", checkpointAfter.Lifecycle)
+	}
+	if len(github.updatePRBodyCalls) != 0 || len(github.reviewerCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls/reviewerCalls = %d/%d, want no PR-side mutations after hold", len(github.updatePRBodyCalls), len(github.reviewerCalls))
+	}
+}
+
+func TestRunOpenPRStepStopsNormalCreatePRSideEffectsWhenHeldAfterPush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issueNumber := int64(48)
+	github := &fakeGitHubGateway{issueDetailResponses: []IssueDetail{
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open"},
+		{Number: issueNumber, State: "open", Labels: []string{domain.HoldLabelWorker}},
+	}}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	now := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_worker_562", ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_worker_562", LoopID: loop.ID, Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Normal create hold", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", Branch: "feature/pr-562", IssueNumber: issueNumber, AutoDiscovered: true, Reviewers: []string{"octocat"}},
+		Worktree:   &checkpointWorktree{Branch: "feature/pr-562", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_562"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle:  &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: "feature/pr-562", BaseBranch: "main"},
+	}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), stepInput{Project: *project, Loop: loop, Run: run, Checkpoint: checkpoint})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runOpenPRStep() error = %v, want hold skip", err)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want normal create-pr push", len(git.pushCalls))
+	}
+	if checkpointAfter.Lifecycle == nil || !checkpointAfter.Lifecycle.Pushed || checkpointAfter.Lifecycle.Actions.Push != lifecycle.ActionSourceFallback {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want pushed fallback lifecycle", checkpointAfter.Lifecycle)
+	}
+	if len(github.createPRCalls) != 0 || len(github.updatePRBodyCalls) != 0 || len(github.reviewerCalls) != 0 {
+		t.Fatalf("createPRCalls/updatePRBodyCalls/reviewerCalls = %d/%d/%d, want no PR-side mutations after hold", len(github.createPRCalls), len(github.updatePRBodyCalls), len(github.reviewerCalls))
+	}
+}
+
+func TestRunOpenPRStepStopsReviewerAssignmentWhenCreatedPRHeld(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issueNumber := int64(51)
+	github := &fakeGitHubGateway{
+		issueDetailResponses: []IssueDetail{
+			{Number: issueNumber, State: "open"},
+			{Number: issueNumber, State: "open"},
+			{Number: issueNumber, State: "open"},
+			{Number: issueNumber, State: "open"},
+		},
+		prDetail:       PullRequestDetail{Number: 565, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		createPRResult: CreatePullRequestResult{Number: 565, URL: "https://example/pr/565"},
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	now := fixture.nowISO()
+	loop := storage.LoopRecord{ID: "loop_worker_565", ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_worker_565", LoopID: loop.ID, Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Created PR hold", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", Branch: "feature/pr-565", IssueNumber: issueNumber, AutoDiscovered: true, Reviewers: []string{"octocat"}},
+		Worktree:   &checkpointWorktree{Branch: "feature/pr-565", BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_565"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle:  &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: "feature/pr-565", BaseBranch: "main"},
+	}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), stepInput{Project: *project, Loop: loop, Run: run, Checkpoint: checkpoint})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runOpenPRStep() error = %v, want hold skip", err)
+	}
+	if len(github.createPRCalls) != 1 {
+		t.Fatalf("len(github.createPRCalls) = %d, want created PR", len(github.createPRCalls))
+	}
+	if len(github.viewPRCalls) != 1 || github.viewPRCalls[0].PRNumber != 565 {
+		t.Fatalf("viewPRCalls = %#v, want created PR hold refresh", github.viewPRCalls)
+	}
+	if len(github.reviewerCalls) != 0 {
+		t.Fatalf("reviewerCalls = %#v, want no reviewer assignment after hold", github.reviewerCalls)
+	}
+	if checkpointAfter.PullRequest == nil || checkpointAfter.PullRequest.Number != 565 {
+		t.Fatalf("checkpointAfter.PullRequest = %#v, want created PR recorded", checkpointAfter.PullRequest)
+	}
+	if checkpointAfter.Lifecycle == nil || checkpointAfter.Lifecycle.PRNumber != 565 || checkpointAfter.Lifecycle.Actions.PR != lifecycle.ActionSourceFallback {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want created PR lifecycle", checkpointAfter.Lifecycle)
+	}
+}
+
+func TestRunOpenPRStepStopsExistingPRSideEffectsWhenHeldAfterPush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issueNumber := int64(49)
+	loopID := "loop_worker_563"
+	branch := buildWorkerBranchName(workerInput{Title: "Existing PR hold", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: issueNumber}, loopID)
+	github := &fakeGitHubGateway{
+		issueDetailResponses: []IssueDetail{
+			{Number: issueNumber, State: "open"},
+			{Number: issueNumber, State: "open"},
+			{Number: issueNumber, State: "open"},
+			{Number: issueNumber, State: "open"},
+		},
+		prDetail: PullRequestDetail{Number: 563, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		openPRs:  []PullRequestSummary{{Number: 563, URL: "https://example/pr/563", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}},
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	now := fixture.nowISO()
+	loop := storage.LoopRecord{ID: loopID, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_worker_563", LoopID: loop.ID, Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Existing PR hold", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", Branch: branch, IssueNumber: issueNumber, AutoDiscovered: true, Reviewers: []string{"octocat"}},
+		Worktree:   &checkpointWorktree{Branch: branch, BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_563"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle:  &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: branch, BaseBranch: "main"},
+	}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), stepInput{Project: *project, Loop: loop, Run: run, Checkpoint: checkpoint})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runOpenPRStep() error = %v, want hold skip", err)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want existing PR push", len(git.pushCalls))
+	}
+	if checkpointAfter.PullRequest == nil || checkpointAfter.PullRequest.Number != 563 {
+		t.Fatalf("checkpointAfter.PullRequest = %#v, want existing PR recorded", checkpointAfter.PullRequest)
+	}
+	if checkpointAfter.Lifecycle == nil || !checkpointAfter.Lifecycle.Pushed || checkpointAfter.Lifecycle.Actions.Push != lifecycle.ActionSourceFallback || checkpointAfter.Lifecycle.Actions.PR != lifecycle.ActionSourceFallback {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want pushed adopted PR lifecycle", checkpointAfter.Lifecycle)
+	}
+	if len(github.viewPRCalls) != 1 || github.viewPRCalls[0].PRNumber != 563 {
+		t.Fatalf("viewPRCalls = %#v, want adopted PR hold refresh", github.viewPRCalls)
+	}
+	if len(github.updatePRBodyCalls) != 0 || len(github.reviewerCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls/reviewerCalls = %d/%d, want no PR-side mutations after hold", len(github.updatePRBodyCalls), len(github.reviewerCalls))
+	}
+}
+
+func TestRunOpenPRStepStopsAdoptedPRSideEffectsWhenExistingPRHeldAfterNormalPush(t *testing.T) {
+	t.Parallel()
+	fixture := newRunnerFixture(t)
+	issueNumber := int64(50)
+	loopID := "loop_worker_564"
+	branch := buildWorkerBranchName(workerInput{Title: "Normal adopted PR hold", Repo: "acme/looper", BaseBranch: "main", ExecutionMode: "create-pr", IssueNumber: issueNumber}, loopID)
+	github := &fakeGitHubGateway{
+		issueDetailResponses: []IssueDetail{
+			{Number: issueNumber, State: "open"},
+			{Number: issueNumber, State: "open"},
+			{Number: issueNumber, State: "open"},
+			{Number: issueNumber, State: "open"},
+		},
+		prDetail:        PullRequestDetail{Number: 564, State: "open", Labels: []string{domain.HoldLabelWorker}},
+		openPRResponses: [][]PullRequestSummary{{}, {{Number: 564, URL: "https://example/pr/564", State: "OPEN", HeadRefName: branch, BaseRefName: "main"}}},
+	}
+	git := &fakeGitGateway{}
+	runner := New(Options{DB: fixture.coordinator.DB(), Repos: fixture.repos, GitHub: github, Git: git, Logger: fixture.logger, Now: fixture.now, AllowAutoCommit: true, AllowAutoPush: true, OpenPRStrategy: config.OpenPRStrategyAllDone})
+
+	project, err := fixture.repos.Projects.GetByID(context.Background(), "project_1")
+	if err != nil || project == nil {
+		t.Fatalf("Projects.GetByID() = (%#v, %v), want project", project, err)
+	}
+	now := fixture.nowISO()
+	loop := storage.LoopRecord{ID: loopID, ProjectID: "project_1", Type: "worker", TargetType: "issue", Status: "running", CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Loops.Upsert(context.Background(), loop); err != nil {
+		t.Fatalf("Loops.Upsert() error = %v", err)
+	}
+	run := storage.RunRecord{ID: "run_worker_564", LoopID: loop.ID, Status: "running", StartedAt: now, CreatedAt: now, UpdatedAt: now}
+	if err := fixture.repos.Runs.Upsert(context.Background(), run); err != nil {
+		t.Fatalf("Runs.Upsert() error = %v", err)
+	}
+	checkpoint := workerCheckpoint{
+		Work:       &workerInput{Title: "Normal adopted PR hold", ExecutionMode: "create-pr", Repo: "acme/looper", BaseBranch: "main", Branch: branch, IssueNumber: issueNumber, AutoDiscovered: true, Reviewers: []string{"octocat"}},
+		Worktree:   &checkpointWorktree{Branch: branch, BaseBranch: "main", HeadSHA: "abc123", ID: "worktree_564"},
+		Validation: &ValidationResult{Passed: true, Summary: "ok"},
+		Lifecycle:  &lifecycle.State{Policy: lifecycle.PolicyAgentManagedWithFallback, PolicyVersion: lifecycle.PolicyVersion, Branch: branch, BaseBranch: "main"},
+	}
+
+	checkpointAfter, err := runner.runOpenPRStep(context.Background(), stepInput{Project: *project, Loop: loop, Run: run, Checkpoint: checkpoint})
+	var holdErr *holdSkipError
+	if !errors.As(err, &holdErr) {
+		t.Fatalf("runOpenPRStep() error = %v, want hold skip", err)
+	}
+	if len(git.pushCalls) != 1 {
+		t.Fatalf("len(git.pushCalls) = %d, want normal create-pr push", len(git.pushCalls))
+	}
+	if checkpointAfter.PullRequest == nil || checkpointAfter.PullRequest.Number != 564 {
+		t.Fatalf("checkpointAfter.PullRequest = %#v, want adopted PR recorded", checkpointAfter.PullRequest)
+	}
+	if checkpointAfter.Lifecycle == nil || !checkpointAfter.Lifecycle.Pushed || checkpointAfter.Lifecycle.Actions.Push != lifecycle.ActionSourceFallback || checkpointAfter.Lifecycle.Actions.PR != lifecycle.ActionSourceFallback {
+		t.Fatalf("checkpointAfter.Lifecycle = %#v, want pushed adopted PR lifecycle", checkpointAfter.Lifecycle)
+	}
+	if len(github.viewPRCalls) != 1 || github.viewPRCalls[0].PRNumber != 564 {
+		t.Fatalf("viewPRCalls = %#v, want adopted PR hold refresh", github.viewPRCalls)
+	}
+	if len(github.updatePRBodyCalls) != 0 || len(github.reviewerCalls) != 0 {
+		t.Fatalf("updatePRBodyCalls/reviewerCalls = %d/%d, want no PR-side mutations after held adopted PR", len(github.updatePRBodyCalls), len(github.reviewerCalls))
+	}
+}
+
 func TestRunOpenPRStepStampsLifecycleAgentPRWithoutExistingFooter(t *testing.T) {
 	t.Parallel()
 	fixture := newRunnerFixture(t)
@@ -3628,6 +4865,7 @@ type fakeGitHubGateway struct {
 	updatePRTitleErrors     []error
 	updatePRTitleIndex      int
 	removeLabels            []PullRequestLabelsInput
+	addLabels               []PullRequestLabelsInput
 	reviewerCalls           []PullRequestReviewersInput
 	addAssigneeCalls        []IssueAssigneesInput
 	addAssigneeErr          error
@@ -3757,6 +4995,11 @@ func (f *fakeGitHubGateway) RemovePullRequestLabels(_ context.Context, input Pul
 	return nil
 }
 
+func (f *fakeGitHubGateway) AddPullRequestLabels(_ context.Context, input PullRequestLabelsInput) error {
+	f.addLabels = append(f.addLabels, input)
+	return nil
+}
+
 func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input PullRequestReviewersInput) error {
 	f.reviewerCalls = append(f.reviewerCalls, input)
 	return nil
@@ -3764,7 +5007,10 @@ func (f *fakeGitHubGateway) AddPullRequestReviewers(_ context.Context, input Pul
 
 type fakeGitGateway struct {
 	createResult   CreateWorktreeResult
+	createErr      error
 	restoreResult  *RestoreWorktreeResult
+	restoreErr     error
+	restoreNil     bool
 	prepareResult  PrepareWorktreeResult
 	inspectResult  InspectHeadResult
 	inspectResults []InspectHeadResult
@@ -3783,6 +5029,9 @@ type fakeGitGateway struct {
 
 func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeInput) (CreateWorktreeResult, error) {
 	f.createCalls = append(f.createCalls, input)
+	if f.createErr != nil {
+		return CreateWorktreeResult{}, f.createErr
+	}
 	result := f.createResult
 	if result.WorktreePath == "" {
 		result.WorktreePath = filepath.Join(input.WorktreeRoot, "wt")
@@ -3801,6 +5050,12 @@ func (f *fakeGitGateway) CreateWorktree(_ context.Context, input CreateWorktreeI
 
 func (f *fakeGitGateway) RestoreWorktree(_ context.Context, input RestoreWorktreeInput) (*RestoreWorktreeResult, error) {
 	f.restoreCalls = append(f.restoreCalls, input)
+	if f.restoreErr != nil {
+		return nil, f.restoreErr
+	}
+	if f.restoreNil {
+		return nil, nil
+	}
 	if f.restoreResult != nil {
 		return f.restoreResult, nil
 	}
@@ -3924,4 +5179,73 @@ func TestUpdateLoopPreservesTerminatedLoop(t *testing.T) {
 	if persisted == nil || persisted.Status != "terminated" {
 		t.Fatalf("Loops.GetByID() = %#v, want terminated loop", persisted)
 	}
+}
+
+func TestStampPullRequestDisclosureUsesRunSnapshotIdentity(t *testing.T) {
+	t.Parallel()
+
+	disclosureCfg := config.DefaultDisclosureConfig()
+	disclosureCfg.Enabled = true
+	disclosureCfg.IncludeAgent = true
+	disclosureCfg.Channels.PullRequest = true
+
+	liveModel := "live-model"
+	runner := New(Options{
+		AgentRuntime: string(config.AgentVendorClaudeCode),
+		AgentModel:   &liveModel,
+		Disclosure:   &disclosureCfg,
+	})
+
+	snapshot := `{"vendor":"codex","model":"frozen-model","profileId":"worker"}`
+	run := storage.RunRecord{AgentSnapshotJSON: &snapshot}
+	got := runner.stampPullRequestDisclosure(run, "PR body")
+	if !strings.Contains(got, "agent=codex") {
+		t.Fatalf("stamp used live identity, got %q", got)
+	}
+	if strings.Contains(got, "agent=claude-code") {
+		t.Fatalf("stamp leaked live runner agent: %q", got)
+	}
+
+	// Empty snapshot falls back to runner identity.
+	legacy := runner.stampPullRequestDisclosure(storage.RunRecord{}, "PR body")
+	if !strings.Contains(legacy, "agent=claude-code") {
+		t.Fatalf("legacy stamp = %q, want runner agent", legacy)
+	}
+
+	// Malformed snapshot must not fall back to live runner identity.
+	bad := "not-json"
+	fallback := runner.stampPullRequestDisclosure(storage.RunRecord{AgentSnapshotJSON: &bad}, "PR body")
+	if strings.Contains(fallback, "agent=claude-code") {
+		t.Fatalf("malformed snapshot stamp leaked live runner agent: %q", fallback)
+	}
+	if strings.Contains(fallback, "agent=codex") {
+		t.Fatalf("malformed snapshot stamp should not invent agent identity: %q", fallback)
+	}
+}
+
+func TestCreatePullRequestInputCarriesDisclosureIdentity(t *testing.T) {
+	t.Parallel()
+
+	gh := &fakeGitHubGateway{createPRResult: CreatePullRequestResult{Number: 9, URL: "https://example/pr/9"}}
+	disclosureCfg := config.DefaultDisclosureConfig()
+	disclosureCfg.Enabled = true
+	disclosureCfg.IncludeAgent = true
+	disclosureCfg.Channels.PullRequest = true
+
+	// Direct adapter-style check: runners set DisclosureAgent from snapshot.
+	input := CreatePullRequestInput{
+		Repo: "acme/looper", HeadBranch: "feat", BaseBranch: "main", Title: "t",
+		Body: "body", DisclosureAgent: "codex", DisclosureModel: "frozen",
+	}
+	_, err := gh.CreatePullRequest(context.Background(), input)
+	if err != nil {
+		t.Fatalf("CreatePullRequest() error = %v", err)
+	}
+	if len(gh.createPRCalls) != 1 {
+		t.Fatalf("createPRCalls = %d, want 1", len(gh.createPRCalls))
+	}
+	if gh.createPRCalls[0].DisclosureAgent != "codex" || gh.createPRCalls[0].DisclosureModel != "frozen" {
+		t.Fatalf("Disclosure fields = %#v", gh.createPRCalls[0])
+	}
+	_ = disclosureCfg
 }

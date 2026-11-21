@@ -1,6 +1,6 @@
 ---
 name: looper
-description: Use when installing, bootstrapping, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, or cursor-cli; when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing status, logs, osascript, git, gh, LOOPER_TOKEN, writable path, or daemon startup issues.
+description: Use when installing, bootstrapping, configuring, starting, verifying, operating, or troubleshooting Looper, looperd, the looper CLI, ~/.looper config, or runtime paths; when setting up Looper with opencode, claude-code, codex, cursor-cli, Grok Build, Pi, or Oh My Pi (omp); when registering repos or configuring planner/reviewer/fixer/worker loops; or when diagnosing status, logs, osascript, git, gh, LOOPER_TOKEN, writable path, or daemon startup issues.
 ---
 
 # Looper
@@ -8,6 +8,10 @@ description: Use when installing, bootstrapping, configuring, starting, verifyin
 Use this skill when an agent needs to install, configure, start, check, operate, or troubleshoot Looper (`looper` CLI, `looperd` daemon, or files under `~/.looper`).
 
 It also covers the full webhook-mode lifecycle — turning it on, installing or validating the `gh webhook` extension, confirming forwarders are healthy, diagnosing a degraded runtime, clearing stale GitHub CLI hooks with `looper webhook cleanup`, and judging when a daemon restart is actually needed.
+
+`looperd` also watches its selected config source while running. Curated hot-safe policy changes—including `agent.vendor`—apply to claims made after publication without restarting the daemon; active runs keep the configuration snapshot they started with. The scheduler remains available when the daemon starts without a vendor, so configuring one later can activate an already prepared model/params profile. Leaving one configured vendor—by switching or clearing it—requires empty `agent.params` and, when a model is explicit, a paired model change or unset; cross-vendor continuations keep checkpoint/worktree state but start a fresh native session. Invalid edits and changes to process-owned settings are rejected as a whole while the daemon keeps its last-known-good snapshot. Use the Configuration page at `/dashboard/config` for supported field-level edits and reload diagnostics, and read [`references/config.md`](references/config.md) before deciding that a restart is required.
+
+Dashboard writes use the revision bound to the published values returned by the config read, then repeat an identity/mode/byte check immediately before atomic rename. This detects external generations present before the final check, including one not yet accepted by the watcher. Portable filesystems leave a tiny final-check-to-rename race, so avoid simultaneous manual and dashboard writes. Without token authentication, config PATCH requires a direct loopback peer and Host authority and rejects proxy-forwarding headers; proxied access requires `local-token` authentication. Dashboard serialization preserves the selected format and unknown top-level extension sections, but may normalize comments and lexical ordering; it also rejects symlinked config paths. Use a targeted manual edit of the symlink target when those constraints matter.
 
 **When NOT to use this skill:** developing on the Looper codebase itself (Go sources at `cmd/`, `internal/`, `pkg/`). For that, follow `AGENTS.md` and standard Go tooling.
 
@@ -39,13 +43,14 @@ Use this when the user wants Looper installed, configured, and running end-to-en
 
 ### Step 0 — Preflight (read-only)
 
-Looper currently supports macOS (`darwin-arm64`) and Linux (`linux-amd64`). Stop and ask the user how to proceed if the host is not supported:
+Looper currently supports macOS (`darwin-arm64`) and Linux (`linux-amd64`, `linux-arm64`). Stop and ask the user how to proceed if the host is not supported:
 
 ```bash
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64|Darwin-aarch64) ;;
   Linux-x86_64|Linux-amd64) ;;
-  *) echo "Looper supports macOS arm64 and Linux x64 only; stop and confirm with the user before continuing." >&2 ;;
+  Linux-aarch64|Linux-arm64) ;;
+  *) echo "Looper supports macOS arm64 and Linux x64/arm64 only; stop and confirm with the user before continuing." >&2 ;;
 esac
 ```
 
@@ -87,6 +92,10 @@ Auto-detect installed agent CLIs in parallel before asking:
 | `codex` | `command -v codex` |
 | `opencode` | `command -v opencode` |
 | `cursor-cli` | `command -v agent` |
+| `grok-build` | `command -v grok` |
+| `pi` | `command -v pi` |
+| `omp` | `command -v omp` |
+| `agy` | `command -v agy` |
 
 Use the `question` tool to let the user pick one. List detected vendors first, marked `(installed)`, with undetected ones appended as `(not installed — needs setup)`. If multiple are installed, do not impose an opinionated default — present them in detection order and let the user choose.
 
@@ -94,7 +103,11 @@ If none are installed, ask the user which one they want to install before contin
 
 After the user picks a vendor, verify it is authenticated (run the vendor's own status command, e.g. `claude --version` followed by a quick auth check, or `agent status`). If the vendor CLI exits with an auth error, surface it and ask the user to log in via the vendor's own flow before continuing.
 
-Looper inherits the vendor's own authentication (e.g. `claude login`, `agent login`, or env vars in the user's shell). **Do not** store agent credentials in the Looper config file (commonly `~/.looper/config.toml`, with some existing installs still using `~/.looper/config.json`).
+Looper inherits the vendor's own authentication (e.g. `claude login`, `agent login`, or env vars in the user's shell). For xAI Grok Build (`agent.vendor = "grok-build"`, executable `grok`), use `grok login --device-auth` or provide `XAI_API_KEY` in the daemon environment. For Pi (`agent.vendor = "pi"`, executable `pi`), Oh My Pi (`agent.vendor = "omp"`, executable `omp`), and Antigravity CLI (`agent.vendor = "agy"`, executable `agy`), use each vendor's own login/config. Prefer those vendor/daemon authentication mechanisms over storing credentials in Looper configuration. If the user explicitly manages a value through `agent.env`, treat it as a local secret: the dashboard/API returns only its key, never its value, and it must not be committed or copied into examples.
+
+Grok Build fresh runs default to `--always-approve` and `--sandbox off` so the agent can update Git metadata outside a linked worktree. Configured arguments override defaults: operators can select a stricter sandbox when the repository layout permits it; `--permission-mode` may prompt or fail unattended runs; non-`plain` output can prevent direct completion-marker parsing; and `-p`/`--single` replaces Looper's generated task prompt. Daemon native resume and interactive `looper resume` takeover are unsupported for Grok Build; retries use a fresh checkpoint prompt, and Looper never uses ambient `--continue`.
+
+Pi fresh runs default to `-p <prompt> --approve` (project-local `.pi` trusted for the run). Oh My Pi (`omp`) fresh runs default to `-p <prompt> --cwd <worktree> --auto-approve`. Antigravity CLI (`agy`) fresh runs default to `-p <prompt> --dangerously-skip-permissions`. Configured print/approve/cwd/approval-mode/mode flags override those defaults. Daemon native resume and interactive `looper resume` takeover are unsupported for `pi`, `omp`, and `agy`; retries use a fresh checkpoint prompt.
 
 ### Step 2 — Pick the first project to watch
 
@@ -130,7 +143,7 @@ If `looper --version` fails, do not guess a new install location. The installer 
 | Existing-config state | Action |
 | --- | --- |
 | Config exists, daemon healthy, no projects yet | Run `looper project add` for the chosen path; skip bootstrap |
-| Config exists with wrong/missing `agent.vendor` | Targeted edit to `agent.vendor` after confirming with the user |
+| Config exists with wrong/missing `agent.vendor` | Targeted edit after confirmation; leaving a configured vendor (switch or clear) requires empty `agent.params` and a paired explicit model change/unset |
 | Config exists, daemon unhealthy | Triage with `looper daemon status` and `looper daemon logs --startup` first; do not re-bootstrap blindly |
 | Config exists and is correct | Skip bootstrap; go to Step 5 verification |
 
@@ -148,6 +161,31 @@ looper bootstrap --yes \
 ```
 
 If the user prefers to drive bootstrap themselves: `looper bootstrap` (interactive). See [`references/cli.md`](references/cli.md) for every supported flag.
+
+#### Plane task-source + Feishu HITL variant
+
+Use this when the issues live in a [Plane](https://plane.so) project (not GitHub) but the code + PRs stay on GitHub. Looper reads work-items from Plane and opens PRs on the GitHub `repo`. `--provider plane` generates a **fresh** config, so only use it when no config exists yet.
+
+```bash
+looper bootstrap --yes \
+  --provider plane \
+  --project-path "$REPO" \
+  --code-repo <owner>/<repo> \
+  --plane-workspace <workspace-slug> \
+  --plane-project <plane-project-uuid> \
+  --trigger-label looper:plan \
+  --feishu-webhook-env LOOPER_FEISHU_WEBHOOK_URL \
+  --agent-vendor "<selected-vendor>"
+```
+
+`--code-repo` may be omitted if `$REPO` has a `github.com` origin (it is auto-detected). Two env vars must be exported in the daemon's shell before Step 5 (never store them in the config):
+
+```bash
+export PLANE_API_KEY="<plane-api-key>"                     # matches --plane-token-env (default PLANE_API_KEY)
+export LOOPER_FEISHU_WEBHOOK_URL="<feishu-bot-webhook-url>" # matches --feishu-webhook-env
+```
+
+Full flag reference, config shape, and follow-ups: [`references/plane.md`](references/plane.md) and [`docs/plane-provider.md`](../../docs/plane-provider.md).
 
 ### Step 5 — Verify the install
 
@@ -222,6 +260,7 @@ For deeper detail, consult these bundled docs before acting:
 - [`references/cli.md`](references/cli.md) — installed `looper` CLI commands, install/uninstall scripts, `looper bootstrap`, `looper project add`, daemon lifecycle, loop inspection.
 - [`references/config.md`](references/config.md) — full Looper config shape, every field, validation rules, env var overrides, CLI flag overrides, role trigger customization, reviewer event mapping.
 - [`references/daemon.md`](references/daemon.md) — `looperd` startup, supervised vs detached mode, launchd integration, log locations, startup-failure triage.
+- [`references/plane.md`](references/plane.md) — Plane task-source provider + Feishu HITL: extra bootstrap flags, the two env vars, generated config shape, and a discovery verify step.
 - [`scripts/check.sh`](scripts/check.sh) — read-only local diagnostic. Verifies `git`, `gh`, `gh auth status`, optional `osascript`, `looper --version`, config presence, and `~/.looper` writability. Invoke via absolute skill path.
 
 When in doubt, prefer read-only checks first:
@@ -249,6 +288,8 @@ looper webhook cleanup owner/repo --confirm
 ## Safety rules
 
 - Do not overwrite or rewrite the Looper config file (`~/.looper/config.toml` on new installs; `~/.looper/config.json` on some existing installs) without explicit user confirmation. Prefer targeted edits.
+- Do not restart `looperd` merely to apply a hot-safe config change. Check `/dashboard/config` or daemon logs for the reload result; restart only for an explicitly reported restart-bound change or a separate lifecycle reason.
+- Do not assume the dashboard is a lossless text editor. It preserves format and unknown top-level sections, but may normalize comments, quoting, and key/table order; it refuses to replace a symlinked config path.
 - Do not delete runtime artifacts (`~/.looper/looper.sqlite`, `backups/`, `logs/`, `worktrees/`) unless the user explicitly asks and understands the impact.
 - Starting or restarting `looperd` can launch background automation against configured GitHub repositories — confirm intent before doing so.
 - Do not toggle `daemon.mode` (foreground ↔ launchd) without confirming; supervised mode persists across login/reboot.
@@ -260,7 +301,9 @@ looper webhook cleanup owner/repo --confirm
 ## Common mistakes
 
 - `cat ~/.looper/config.*` as a first move: use `looper config show` instead and redact secrets.
-- Restarting the daemon under pressure: check status/logs first; restart can re-trigger automation.
+- Restarting after every config edit: hot-safe policy reloads automatically for claims made after publication. Check the Configuration page or logs first; restart can re-trigger automation.
+- Assuming every valid edit was applied: a restart-bound field in the same candidate rejects the entire reload, and the last-known-good snapshot remains active until the file is corrected or the daemon is restarted with that config.
+- Submitting a stale Configuration page repeatedly: the patch revision intentionally conflicts after another editor changes the file; wait for a safe edit to publish and refresh, or resolve the displayed reload diagnostics in the file before retrying.
 - Disabling `notifications.osascript.enabled` silently: confirm the change or set an explicit `tools.osascriptPath`.
 - Rewriting the whole config for one fix: make targeted edits and preserve existing settings.
 - Treating a missing `~/.looper/` directory as permission to create or delete data: explain impact and ask first.

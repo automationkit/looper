@@ -19,6 +19,7 @@ import (
 	"github.com/nexu-io/looper/internal/coordinator/triage"
 	"github.com/nexu-io/looper/internal/disclosure"
 	"github.com/nexu-io/looper/internal/eventlog"
+	"github.com/nexu-io/looper/internal/hostingidentity"
 	githubinfra "github.com/nexu-io/looper/internal/infra/github"
 	"github.com/nexu-io/looper/internal/infra/specpr"
 	"github.com/nexu-io/looper/internal/network/protocol"
@@ -100,6 +101,22 @@ type Options struct {
 	Inspector  RepositoryInspector
 	Disclosure *config.DisclosureConfig
 	Network    NetworkGateway
+	State      *RuntimeState
+}
+
+// RuntimeState contains coordinator lifecycle state that must outlive one
+// immutable configuration snapshot. Snapshot-specific policy remains on Runner.
+type RuntimeState struct {
+	mu                sync.Mutex
+	lastTickByProject map[string]time.Time
+	watchLocks        map[string]*sync.Mutex
+}
+
+func NewRuntimeState() *RuntimeState {
+	return &RuntimeState{
+		lastTickByProject: map[string]time.Time{},
+		watchLocks:        map[string]*sync.Mutex{},
+	}
 }
 
 type Runner struct {
@@ -112,10 +129,7 @@ type Runner struct {
 	inspector  RepositoryInspector
 	disclosure *config.DisclosureConfig
 	network    NetworkGateway
-
-	mu                sync.Mutex
-	lastTickByProject map[string]time.Time
-	watchLocks        map[string]*sync.Mutex
+	state      *RuntimeState
 }
 
 type loadedIssue struct {
@@ -159,22 +173,32 @@ func New(options Options) *Runner {
 	if inspector == nil {
 		inspector = localRepositoryInspector{}
 	}
+	state := options.State
+	if state == nil {
+		state = NewRuntimeState()
+	}
 	return &Runner{
-		repos:             options.Repos,
-		github:            options.GitHub,
-		config:            options.Config,
-		logger:            options.Logger,
-		now:               now,
-		triageLLM:         options.TriageLLM,
-		inspector:         inspector,
-		network:           options.Network,
-		disclosure:        options.Disclosure,
-		lastTickByProject: map[string]time.Time{},
-		watchLocks:        map[string]*sync.Mutex{},
+		repos:      options.Repos,
+		github:     options.GitHub,
+		config:     options.Config,
+		logger:     options.Logger,
+		now:        now,
+		triageLLM:  options.TriageLLM,
+		inspector:  inspector,
+		network:    options.Network,
+		disclosure: options.Disclosure,
+		state:      state,
 	}
 }
 
 func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (DiscoveryResult, error) {
+	if r.config != nil {
+		bound, err := hostingidentity.Bind(ctx, *r.config, input.ProjectID, "coordinator")
+		if err != nil {
+			return DiscoveryResult{}, err
+		}
+		ctx = bound
+	}
 	ctx = githubinfra.ContextWithDiscoverySnapshot(ctx, input.Snapshot)
 	if !r.shouldRunTick(input.ProjectID) {
 		return DiscoveryResult{Skipped: true}, nil
@@ -254,7 +278,7 @@ func (r *Runner) DiscoverIssues(ctx context.Context, input DiscoveryInput) (Disc
 		}
 		analysisStartedAt := r.now().UTC()
 		processed++
-		decision, err := r.decide(ctx, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
+		decision, err := r.decide(ctx, input.ProjectID, project.RepoPath, input.Repo, loadedIssue.issue, triageCfg)
 		if err != nil {
 			return DiscoveryResult{}, err
 		}
@@ -415,7 +439,7 @@ func (r *Runner) hasDispatchWork(action dispatch.Action) bool {
 	return action.ReactionCommentID != 0 || len(action.TriggerLabels) != 0 || action.FailureCommentBody != ""
 }
 
-func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
+func (r *Runner) decide(ctx context.Context, projectID string, repoPath string, repo string, issue triage.Issue, cfg triage.Config) (triage.Decision, error) {
 	reTriage := triage.ShouldReTriage(issue, cfg, r.now().UTC())
 	if !reTriage && !triage.ShouldTriage(issue, cfg, r.now().UTC()) {
 		return triage.NoOpDecision(), nil
@@ -426,7 +450,7 @@ func (r *Runner) decide(ctx context.Context, repoPath string, repo string, issue
 	}
 	repoCtx.Repo = repo
 	repoCtx.WorkingDirectory = repoPath
-	return triage.Decide(ctx, r.triageLLM, triage.Input{Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()}), nil
+	return triage.Decide(ctx, r.triageLLM, triage.Input{ProjectID: projectID, Issue: issue, RepoContext: repoCtx, Config: cfg, Now: r.now().UTC()}), nil
 }
 
 func (r *Runner) applyDecision(ctx context.Context, repo string, cwd string, issue triage.Issue, cfg triage.Config, analysisStartedAt time.Time, decision triage.Decision) error {
@@ -1783,13 +1807,13 @@ func (r *Runner) shouldRunTick(projectID string) bool {
 		return true
 	}
 	now := r.now().UTC()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	lastRun, ok := r.lastTickByProject[projectID]
+	r.state.mu.Lock()
+	defer r.state.mu.Unlock()
+	lastRun, ok := r.state.lastTickByProject[projectID]
 	if ok && now.Sub(lastRun) < interval {
 		return false
 	}
-	r.lastTickByProject[projectID] = now
+	r.state.lastTickByProject[projectID] = now
 	return true
 }
 

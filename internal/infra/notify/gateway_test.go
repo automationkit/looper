@@ -35,7 +35,6 @@ func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing
 			},
 		},
 		OsascriptPath: scriptPath,
-		LogFilePath:   filepath.Join(rootDir, "logs", "looperd.log"),
 		Repositories:  repos,
 		Now:           func() time.Time { return now },
 	})
@@ -72,16 +71,16 @@ func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing
 	if err != nil {
 		t.Fatalf("Notifications.List() error = %v", err)
 	}
-	if len(notifications) != 4 {
-		t.Fatalf("Notifications.List() len = %d, want 4", len(notifications))
+	if len(notifications) != 6 {
+		t.Fatalf("Notifications.List() len = %d, want 6", len(notifications))
 	}
 
 	events, err := repos.Events.ListByEntity(ctx, "task", "task_1")
 	if err != nil {
 		t.Fatalf("Events.ListByEntity() error = %v", err)
 	}
-	if len(events) != 4 {
-		t.Fatalf("Events.ListByEntity() len = %d, want 4", len(events))
+	if len(events) != 6 {
+		t.Fatalf("Events.ListByEntity() len = %d, want 6", len(events))
 	}
 
 	osascriptCallsBytes, err := os.ReadFile(capturePath)
@@ -89,10 +88,10 @@ func TestGatewayPersistsInAppNotificationsAndDedupesOsascriptDelivery(t *testing
 		t.Fatalf("ReadFile(%q) error = %v", capturePath, err)
 	}
 	osascriptCalls := string(osascriptCallsBytes)
-	assertContains(t, osascriptCalls, "display dialog")
-	assertContains(t, osascriptCalls, "Open Log")
-	assertContains(t, osascriptCalls, "open ")
-	assertContains(t, osascriptCalls, filepath.Join(rootDir, "logs", "looperd.log"))
+	assertContains(t, osascriptCalls, "display notification")
+	if strings.Contains(osascriptCalls, "display dialog") {
+		t.Fatalf("failure notification must not open a dialog: %q", osascriptCalls)
+	}
 }
 
 func TestGatewayUsesLightweightOsascriptNotificationForNonFailureLevels(t *testing.T) {

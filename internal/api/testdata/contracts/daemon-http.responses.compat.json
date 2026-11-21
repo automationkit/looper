@@ -7,7 +7,8 @@
   ],
   "notes": [
     "This artifact freezes the current /api/v1 success-envelope JSON shapes using the seeded fixture in apps/looperd/src/server/index.test.ts.",
-    "Values normalized as placeholders are environment- or runtime-generated but the surrounding JSON shape is part of the compatibility boundary."
+    "Values normalized as placeholders are environment- or runtime-generated but the surrounding JSON shape is part of the compatibility boundary.",
+    "A route with sameAs intentionally shares the complete frozen response shape of the referenced route."
   ],
   "placeholders": {
     "<tmp-root>": "Temporary fixture root directory used by the test harness.",
@@ -33,8 +34,8 @@
             "dbPath": "<tmp-root>/state/looper.sqlite",
             "lastUpdatedAt": "<generated-timestamp>",
             "migration": {
-              "latestAvailableId": "0017_remove_sweeper_storage",
-              "latestAppliedId": "0017_remove_sweeper_storage",
+              "latestAvailableId": "0019_run_agent_snapshot",
+              "latestAppliedId": "0019_run_agent_snapshot",
               "pendingCount": 0
             }
           }
@@ -61,6 +62,7 @@
               "buildTimestamp": null
             },
             "daemonMode": "foreground",
+            "admissionState": "ready",
             "startedAt": "2026-04-11T12:00:00.000Z",
             "recovery": {
               "expiredLocksReleased": 1
@@ -73,14 +75,15 @@
               "artifactName": "<artifact-name>",
               "supportedTargets": [
                 "darwin-arm64",
-                "linux-amd64"
+                "linux-amd64",
+                "linux-arm64"
               ]
             }
           },
           "storage": {
             "mode": "sqlite",
             "dbPath": "<tmp-root>/state/looper.sqlite",
-            "schemaVersion": "0017_remove_sweeper_storage",
+            "schemaVersion": "0019_run_agent_snapshot",
             "pendingMigrations": [],
             "healthy": true
           },
@@ -201,6 +204,7 @@
             "inAppEnabled": true,
             "osascriptEnabled": true
           },
+          "providers": [],
           "tools": {
             "git": true,
             "gh": true,
@@ -219,8 +223,7 @@
           "server": {
             "host": "127.0.0.1",
             "port": 17310,
-            "authMode": "none",
-            "localTokenConfigured": false
+            "authMode": "none"
           },
           "storage": {
             "mode": "sqlite",
@@ -242,8 +245,15 @@
             "publicBaseUrl": "",
             "fallbackPollIntervalSeconds": 300
           },
+          "network": {
+            "enrolled": false,
+            "loopernetBaseUrl": "",
+            "nodeName": "",
+            "githubLogin": ""
+          },
           "agent": {
             "env": {},
+            "envKeys": [],
             "nativeResume": {
               "enabled": true
             },
@@ -278,6 +288,25 @@
                 "failure"
               ],
               "throttleWindowSeconds": 60
+            },
+            "webhook": {
+              "enabled": false,
+              "urlEnv": "",
+              "format": "generic",
+              "levels": null,
+              "throttleWindowSeconds": 60
+            }
+          },
+          "disclosure": {
+            "enabled": true,
+            "includeAgent": true,
+            "includeOS": false,
+            "channels": {
+              "gitCommit": true,
+              "pullRequest": true,
+              "issueComment": true,
+              "reviewComment": true,
+              "inlineCommentVisible": true
             }
           },
           "tools": {
@@ -316,7 +345,17 @@
             "allowRiskyFixes": false,
             "fixAllPullRequests": false,
             "openPrStrategy": "all_done",
-            "addSnapshotMode": "async"
+            "addSnapshotMode": "async",
+            "loop": {
+              "quietPeriodSeconds": 60
+            }
+          },
+          "instructions": {
+            "enabled": true,
+            "maxBytes": 8192
+          },
+          "hitl": {
+            "enabled": false
           },
           "roles": {
             "coordinator": {
@@ -382,6 +421,7 @@
                   "minPublishIntervalSeconds": 300,
                   "maxIterationsPerPR": 20,
                   "maxIterationsPerHead": 1,
+                  "maxPublishesPerPR": 3,
                   "maxWallClockSeconds": 0,
                   "maxConsecutiveFailures": 3,
                   "maxAgentExecutionsPerPR": 25,
@@ -416,6 +456,10 @@
                   "requireCurrentReviewRequest": true,
                   "requireNewHeadSinceThread": true,
                   "scope": "looper_authored_only"
+                },
+                "relatedFileGroups": {
+                  "enabled": false,
+                  "minChangedFiles": 24
                 }
               },
               "discovery": {
@@ -430,6 +474,11 @@
                   "includeReviewingLabel": true,
                   "reviewingLabel": "looper:spec-reviewing"
                 }
+              },
+              "skills": {
+                "mode": "extend",
+                "required": [],
+                "optional": []
               }
             },
             "fixer": {
@@ -439,6 +488,12 @@
                 "labels": [],
                 "labelMode": "all",
                 "authorFilter": "current_user"
+              },
+              "behavior": {
+                "loop": {
+                  "quietPeriodSeconds": 0,
+                  "maxPushesPerPR": 3
+                }
               }
             },
             "worker": {
@@ -452,10 +507,24 @@
               }
             }
           },
-          "projects": []
+          "providers": [],
+          "projects": [],
+          "metadata": {
+            "configPath": "",
+            "format": "",
+            "filePresent": false,
+            "revision": "",
+            "rejectedPaths": [],
+            "fields": {}
+          }
         },
         "requestId": "fixture-request-id"
       }
+    },
+    {
+      "id": "config.patch",
+      "status": 200,
+      "sameAs": "config.get"
     },
     {
       "id": "events.list",
@@ -625,14 +694,21 @@
               "repo": "acme/looper",
               "prNumber": 42,
               "status": "running",
+              "displayStatus": "manual_intervention",
               "configJson": null,
               "metadataJson": null,
               "lastRunAt": "2026-04-11T12:00:00.000Z",
               "nextRunAt": "2026-04-11T12:00:00.000Z",
               "createdAt": "2026-04-11T12:00:00.000Z",
-              "updatedAt": "2026-04-11T12:00:00.000Z"
+              "updatedAt": "2026-04-11T12:00:00.000Z",
+              "attempts": 1,
+              "maxAttempts": 3,
+              "lastFailureKind": "manual_intervention",
+              "lastFailureReason": "dirty worker worktree"
             }
-          ]
+          ],
+          "total": 1,
+          "offset": 0
         },
         "requestId": "fixture-request-id"
       }
@@ -677,12 +753,17 @@
           "repo": "acme/looper",
           "prNumber": 42,
           "status": "running",
+          "displayStatus": "manual_intervention",
           "configJson": null,
           "metadataJson": null,
           "lastRunAt": "2026-04-11T12:00:00.000Z",
           "nextRunAt": "2026-04-11T12:00:00.000Z",
           "createdAt": "2026-04-11T12:00:00.000Z",
-          "updatedAt": "2026-04-11T12:00:00.000Z"
+          "updatedAt": "2026-04-11T12:00:00.000Z",
+          "attempts": 1,
+          "maxAttempts": 3,
+          "lastFailureKind": "manual_intervention",
+          "lastFailureReason": "dirty worker worktree"
         },
         "requestId": "fixture-request-id"
       }
@@ -709,6 +790,58 @@
           "agent": null
         },
         "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.logs.follow",
+      "status": 200,
+      "contentType": "text/event-stream",
+      "notes": [
+        "GET /api/v1/loops/{id}/logs?follow=1 returns text/event-stream (not a JSON envelope).",
+        "Wire format: event: <name>\\ndata: <json>\\n\\n",
+        "Event order: snapshot (once), zero or more chunk, optional end then close.",
+        "snapshot data shape matches loop.logs body.data.",
+        "chunk data shape: { content: string, runId?, currentStep?, executionId?, vendor?, pid?, status? }.",
+        "end data shape: { reason?: string } (e.g. run_completed)."
+      ],
+      "events": {
+        "snapshot": {
+          "event": "snapshot",
+          "data": {
+            "seq": 1,
+            "loopId": "loop_1",
+            "loopType": "reviewer",
+            "loopStatus": "running",
+            "run": {
+              "runId": "run_1",
+              "status": "running",
+              "currentStep": "review",
+              "startedAt": "2026-04-11T12:00:00.000Z",
+              "endedAt": null,
+              "summary": null,
+              "errorMessage": null
+            },
+            "agent": null
+          }
+        },
+        "chunk": {
+          "event": "chunk",
+          "data": {
+            "content": "appended log text",
+            "runId": "run_1",
+            "currentStep": "review",
+            "executionId": "exec_1",
+            "vendor": "opencode",
+            "pid": 12345,
+            "status": "running"
+          }
+        },
+        "end": {
+          "event": "end",
+          "data": {
+            "reason": "run_completed"
+          }
+        }
       }
     },
     {
@@ -757,6 +890,86 @@
           "nextRunAt": null,
           "createdAt": "2026-04-11T12:00:00.000Z",
           "updatedAt": "<generated-timestamp>"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.retry",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "loop": {
+            "id": "loop_1",
+            "seq": 1,
+            "projectId": "project_1",
+            "type": "reviewer",
+            "targetType": "pull_request",
+            "targetId": "pr:acme/looper:42",
+            "repo": "acme/looper",
+            "prNumber": 42,
+            "status": "queued",
+            "configJson": null,
+            "metadataJson": null,
+            "lastRunAt": "2026-04-11T12:00:00.000Z",
+            "nextRunAt": "<generated-timestamp>",
+            "createdAt": "2026-04-11T12:00:00.000Z",
+            "updatedAt": "<generated-timestamp>"
+          },
+          "queueItemId": "<uuid>",
+          "mode": "auto",
+          "resetAttempts": true,
+          "discardWorktreeChanges": false,
+          "clearUnusableWorktreePath": false
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.takeover",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "loopId": "loop_1",
+          "vendor": "codex",
+          "sessionId": "session_fixture_1",
+          "worktreePath": "/tmp/worktrees/loop_1",
+          "supported": true,
+          "resumeCommand": "cd /tmp/worktrees/loop_1 && codex resume session_fixture_1"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "loop.handback",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "loop": {
+            "id": "loop_1",
+            "seq": 1,
+            "projectId": "project_1",
+            "type": "reviewer",
+            "targetType": "pull_request",
+            "targetId": "pr:acme/looper:42",
+            "repo": "acme/looper",
+            "prNumber": 42,
+            "status": "queued",
+            "configJson": null,
+            "metadataJson": null,
+            "lastRunAt": "2026-04-11T12:00:00.000Z",
+            "nextRunAt": "<generated-timestamp>",
+            "createdAt": "2026-04-11T12:00:00.000Z",
+            "updatedAt": "<generated-timestamp>"
+          },
+          "queueItemId": "<uuid>",
+          "mode": "auto",
+          "resetAttempts": true,
+          "discardWorktreeChanges": false,
+          "clearUnusableWorktreePath": false
         },
         "requestId": "fixture-request-id"
       }
@@ -829,6 +1042,7 @@
               "repoPath": "/tmp/looper",
               "baseBranch": "main",
               "archived": false,
+              "provider": "github",
               "repo": "acme/looper",
               "worktreeRoot": null,
               "createdAt": "2026-04-11T12:00:00.000Z",
@@ -850,6 +1064,7 @@
           "repoPath": "/tmp/repos/looper",
           "baseBranch": "main",
           "archived": false,
+          "provider": "github",
           "repo": "nexu-io/looper",
           "worktreeRoot": null,
           "createdAt": "2026-04-11T12:00:00.000Z",
@@ -950,6 +1165,8 @@
               "status": "queued",
               "loopStatus": "queued",
               "displayStatus": "queued",
+              "attempts": 0,
+              "maxAttempts": 3,
               "currentStep": null,
               "startedAt": "<generated-timestamp>",
               "target": {
@@ -1001,6 +1218,29 @@
         "data": {
           "stopped": true,
           "loopId": "loop_1"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "dashboard.bootstrap.code",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "code": "<bootstrap-code>",
+          "expiresAt": "<generated-timestamp>"
+        },
+        "requestId": "fixture-request-id"
+      }
+    },
+    {
+      "id": "dashboard.bootstrap.exchange",
+      "status": 200,
+      "body": {
+        "ok": true,
+        "data": {
+          "token": "<local-token>"
         },
         "requestId": "fixture-request-id"
       }
